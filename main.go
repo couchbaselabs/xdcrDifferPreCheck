@@ -387,7 +387,8 @@ func connectToRemoteKV(ref *metadata.RemoteClusterReference, hostAddr string, po
 	errs := make([]error, 0)
 	defer func() { ch <- errs }()
 
-	poolName := "connectionPreCheckPool"
+	now := time.Now().UnixNano()
+	poolName := fmt.Sprintf("connectionPreCheckPool%v", now)
 	hostname := xdcrBase.GetHostName(hostAddr)
 
 	username, password, _, cert, SANInCert, clientCert, clientKey, err := ref.MyCredentials()
