@@ -38,3 +38,5 @@ use "-g" change the mode of pre-check:
 ```
 ./runDiffer.sh -u Administrator -p wewewe -h 127.0.0.1:9000 -r C2 -s B1 -t B2 -g 2
 ```
+## Limitations
+- Doesn't support alternate addresses
