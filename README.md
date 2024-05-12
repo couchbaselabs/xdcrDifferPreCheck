@@ -28,3 +28,13 @@ use "-g" change the mode of pre-check:
 	- Results will be logged in xdcrDiffer_kvPreCheck.log
 
 ```
+## Examples
+```
+./runDiffer.sh -u Administrator -p wewewe -h 127.0.0.1:9000 -r C2 -s B1 -t B2 -g 0
+```
+```
+./runDiffer.sh -u Administrator -p wewewe -h 127.0.0.1:9000 -r C2 -s B1 -t B2 -g 1
+```
+```
+./runDiffer.sh -u Administrator -p wewewe -h 127.0.0.1:9000 -r C2 -s B1 -t B2 -g 2
+```
