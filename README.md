@@ -5,6 +5,13 @@ xdcrDifferPreCheck, can be used to do the following:
 2. Connect to memcached port of all source cluster nodes and target cluster nodes using the credentials which xdcrDiffer would use.
 3. Run xdcrDiffer with SDK verbose debug logging.
 
+## Setup
+```
+$ make clean # to clean up any old setup that exists
+$ make deps
+$ make
+```
+
 ## Flags to run
 ```
 ./runDiffer.sh -h
