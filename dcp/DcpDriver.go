@@ -11,19 +11,18 @@ package dcp
 
 import (
 	"fmt"
+	gocbcore "github.com/couchbase/gocbcore/v9"
+	xdcrBase "github.com/couchbase/goxdcr/base"
+	xdcrParts "github.com/couchbase/goxdcr/base/filter"
+	xdcrLog "github.com/couchbase/goxdcr/log"
+	"github.com/couchbase/goxdcr/metadata"
+	xdcrUtils "github.com/couchbase/goxdcr/utils"
 	"sync"
 	"sync/atomic"
 	"time"
 	"xdcrDiffer/base"
 	fdp "xdcrDiffer/fileDescriptorPool"
 	"xdcrDiffer/utils"
-
-	gocbcore "github.com/couchbase/gocbcore/v10"
-	xdcrBase "github.com/couchbase/goxdcr/base"
-	xdcrParts "github.com/couchbase/goxdcr/base/filter"
-	xdcrLog "github.com/couchbase/goxdcr/log"
-	"github.com/couchbase/goxdcr/metadata"
-	xdcrUtils "github.com/couchbase/goxdcr/utils"
 )
 
 type DcpDriver struct {
@@ -61,13 +60,10 @@ type DcpDriver struct {
 	dataPool            xdcrBase.DataPool
 	utils               xdcrUtils.UtilsIface
 	bufferCapacity      int
-	migrationMapping    metadata.CollectionNamespaceMapping
-	mobileCompatible    int
-	expDelMode          xdcrBase.FilterExpDelType
 
 	// various counters
-	totalNumReceivedFromDCP                uint64
-	totalSysOrUnsubbedEventReceivedFromDCP uint64
+	totalNumReceivedFromDCP      uint64
+	totalSysEventReceivedFromDCP uint64
 }
 
 type VBStateWithLock struct {
@@ -91,7 +87,7 @@ const (
 	DriverStateStopped DriverState = iota
 )
 
-func NewDcpDriver(logger *xdcrLog.CommonLogger, name, url, bucketName string, ref *metadata.RemoteClusterReference, fileDir, checkpointFileDir, oldCheckpointFileName, newCheckpointFileName string, numberOfClients, numberOfWorkers, numberOfBins, dcpHandlerChanSize int, bucketOpTimeout time.Duration, maxNumOfGetStatsRetry int, getStatsRetryInterval, getStatsMaxBackoff time.Duration, checkpointInterval int, errChan chan error, waitGroup *sync.WaitGroup, completeBySeqno bool, fdPool fdp.FdPoolIface, filter xdcrParts.Filter, capabilities metadata.Capability, collectionIds []uint32, colMigrationFilters []string, utils xdcrUtils.UtilsIface, bufferCap int, migrationMapping metadata.CollectionNamespaceMapping, mobileCompat int, expDelMode xdcrBase.FilterExpDelType) *DcpDriver {
+func NewDcpDriver(logger *xdcrLog.CommonLogger, name, url, bucketName string, ref *metadata.RemoteClusterReference, fileDir, checkpointFileDir, oldCheckpointFileName, newCheckpointFileName string, numberOfClients, numberOfWorkers, numberOfBins, dcpHandlerChanSize int, bucketOpTimeout time.Duration, maxNumOfGetStatsRetry int, getStatsRetryInterval, getStatsMaxBackoff time.Duration, checkpointInterval int, errChan chan error, waitGroup *sync.WaitGroup, completeBySeqno bool, fdPool fdp.FdPoolIface, filter xdcrParts.Filter, capabilities metadata.Capability, collectionIds []uint32, colMigrationFilters []string, utils xdcrUtils.UtilsIface, bufferCap int) *DcpDriver {
 	dcpDriver := &DcpDriver{
 		Name:                name,
 		url:                 url,
@@ -119,9 +115,6 @@ func NewDcpDriver(logger *xdcrLog.CommonLogger, name, url, bucketName string, re
 		colMigrationFilters: colMigrationFilters,
 		utils:               utils,
 		bufferCapacity:      bufferCap,
-		migrationMapping:    migrationMapping,
-		mobileCompatible:    mobileCompat,
-		expDelMode:          expDelMode,
 	}
 
 	var vbno uint16
@@ -214,8 +207,8 @@ func (d *DcpDriver) Stop() error {
 		return nil
 	}
 
-	d.logger.Infof("Dcp driver %v stopping after receiving %v mutations (%v system + unsubscribed events)\n", d.Name,
-		atomic.LoadUint64(&d.totalNumReceivedFromDCP), atomic.LoadUint64(&d.totalSysOrUnsubbedEventReceivedFromDCP))
+	d.logger.Infof("Dcp driver %v stopping after receiving %v mutations (%v system events)\n", d.Name,
+		atomic.LoadUint64(&d.totalNumReceivedFromDCP), atomic.LoadUint64(&d.totalSysEventReceivedFromDCP))
 	defer d.logger.Infof("Dcp driver %v stopped\n", d.Name)
 	defer d.waitGroup.Done()
 
@@ -265,8 +258,7 @@ func (d *DcpDriver) initializeDcpClients() {
 		}
 
 		d.childWaitGroup.Add(1)
-		dcpClient := NewDcpClient(d, i, vbList, d.childWaitGroup, d.startVbtsDoneChan, d.capabilities, d.collectionIDs,
-			d.colMigrationFilters, d.utils, d.bufferCapacity, d.migrationMapping)
+		dcpClient := NewDcpClient(d, i, vbList, d.childWaitGroup, d.startVbtsDoneChan, d.capabilities, d.collectionIDs, d.colMigrationFilters, d.utils, d.bufferCapacity)
 		d.clients[i] = dcpClient
 	}
 }
@@ -356,6 +348,6 @@ func (d *DcpDriver) IncrementDocReceived() {
 	atomic.AddUint64(&d.totalNumReceivedFromDCP, 1)
 }
 
-func (d *DcpDriver) IncrementSysOrUnsubbedEventReceived() {
-	atomic.AddUint64(&d.totalSysOrUnsubbedEventReceivedFromDCP, 1)
+func (d *DcpDriver) IncrementSysEventReceived() {
+	atomic.AddUint64(&d.totalSysEventReceivedFromDCP, 1)
 }

@@ -170,6 +170,7 @@ type DifferDriver struct {
 	numberOfBins      int
 	waitGroup         *sync.WaitGroup
 	srcDiffKeys       DiffKeysMap
+	srcMigrationHint  MigrationHintMap
 	tgtDiffKeys       DiffKeysMap
 	stateLock         *sync.RWMutex
 	fileDescPool      *fdp.FdPool
@@ -184,8 +185,6 @@ type DifferDriver struct {
 	SrcVbItemCntMap   map[uint16]int
 	TgtVbItemCntMap   map[uint16]int
 	MapLock           *sync.RWMutex
-	srcMigrationHint  MigrationHintMap
-	DuplicatedHint    DuplicatedHintMap
 }
 
 func NewDifferDriver(sourceFileDir, targetFileDir, diffFileDir, diffKeysFileName string, numberOfWorkers, numberOfBins, numberOfFds int, collectionMapping map[uint32][]uint32, colFilterStrings []string, colFilterTgtIds []uint32) *DifferDriver {
@@ -214,7 +213,6 @@ func NewDifferDriver(sourceFileDir, targetFileDir, diffFileDir, diffKeysFileName
 		SrcVbItemCntMap:   make(map[uint16]int),
 		TgtVbItemCntMap:   make(map[uint16]int),
 		MapLock:           &sync.RWMutex{},
-		DuplicatedHint:    DuplicatedHintMap{},
 	}
 }
 
@@ -222,8 +220,6 @@ func (dr *DifferDriver) Run() error {
 	loadDistribution := utils.BalanceLoad(dr.numberOfWorkers, base.NumberOfVbuckets)
 
 	go dr.reportStatus()
-
-	var differHandlers []*DifferHandler
 
 	for i := 0; i < dr.numberOfWorkers; i++ {
 		lowIndex := loadDistribution[i][0]
@@ -235,17 +231,10 @@ func (dr *DifferDriver) Run() error {
 
 		dr.waitGroup.Add(1)
 		differHandler := NewDifferHandler(dr, i, dr.sourceFileDir, dr.targetFileDir, vbList, dr.numberOfBins, dr.waitGroup, dr.fileDescPool, dr.collectionMapping, dr.colFilterStrings, dr.colFilterTgtIds)
-		differHandlers = append(differHandlers, differHandler)
 		go differHandler.run()
 	}
-	dr.waitGroup.Wait()
 
-	// Each handler contains a different set of VBs, and DuplicatedHint is one entity that
-	// contains all documents (from all VBs)
-	// Thus, merge is needed to ensure a complete view of all documents across all VBs
-	for _, handler := range differHandlers {
-		dr.DuplicatedHint.Merge(handler.duplicatedHintMap)
-	}
+	dr.waitGroup.Wait()
 
 	dr.Stop()
 
@@ -376,8 +365,6 @@ type DifferHandler struct {
 	collectionMapping map[uint32][]uint32
 	colFilterStrings  []string
 	colFilterTgtIds   []uint32
-
-	duplicatedHintMap DuplicatedHintMap
 }
 
 func NewDifferHandler(driver *DifferDriver, index int, sourceFileDir, targetFileDir string, vbList []uint16, numberOfBins int, waitGroup *sync.WaitGroup, fdPool *fdp.FdPool, collectionMapping map[uint32][]uint32, colFilterStrings []string, colFilterTgtIds []uint32) *DifferHandler {
@@ -393,7 +380,6 @@ func NewDifferHandler(driver *DifferDriver, index int, sourceFileDir, targetFile
 		collectionMapping: collectionMapping,
 		colFilterStrings:  colFilterStrings,
 		colFilterTgtIds:   colFilterTgtIds,
-		duplicatedHintMap: DuplicatedHintMap{},
 	}
 }
 
@@ -440,8 +426,6 @@ func (dh *DifferHandler) run() error {
 			}
 			srcVbItemCnt += filesDiffer.file1ItemCount
 			tgtVbItemCnt += filesDiffer.file2ItemCount
-
-			dh.duplicatedHintMap.Merge(filesDiffer.duplicatedHintMap)
 		}
 		atomic.AddInt64(&dh.driver.SourceItemCount, int64(srcVbItemCnt))
 		atomic.AddInt64(&dh.driver.TargetItemCount, int64(tgtVbItemCnt))

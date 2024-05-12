@@ -12,19 +12,18 @@ package dcp
 import (
 	"crypto/tls"
 	"fmt"
+	gocb "github.com/couchbase/gocb/v2"
+	gocbcore "github.com/couchbase/gocbcore/v9"
+	xdcrBase "github.com/couchbase/goxdcr/base"
+	xdcrLog "github.com/couchbase/goxdcr/log"
+	"github.com/couchbase/goxdcr/metadata"
+	xdcrUtils "github.com/couchbase/goxdcr/utils"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 	"xdcrDiffer/base"
 	"xdcrDiffer/utils"
-
-	gocb "github.com/couchbase/gocb/v2"
-	gocbcore "github.com/couchbase/gocbcore/v10"
-	xdcrBase "github.com/couchbase/goxdcr/base"
-	xdcrLog "github.com/couchbase/goxdcr/log"
-	"github.com/couchbase/goxdcr/metadata"
-	xdcrUtils "github.com/couchbase/goxdcr/utils"
 )
 
 type DcpClient struct {
@@ -46,7 +45,6 @@ type DcpClient struct {
 	collectionIds       []uint32
 	colMigrationFilters []string
 	bufferCap           int
-	migrationMapping    metadata.CollectionNamespaceMapping
 
 	gocbcoreDcpFeed *GocbcoreDCPFeed
 	utils           xdcrUtils.UtilsIface
@@ -55,7 +53,7 @@ type DcpClient struct {
 	kvVbMap      map[string][]uint16
 }
 
-func NewDcpClient(dcpDriver *DcpDriver, i int, vbList []uint16, waitGroup *sync.WaitGroup, startVbtsDoneChan chan bool, capabilities metadata.Capability, collectionIds []uint32, colMigrationFilters []string, utils xdcrUtils.UtilsIface, bufferCap int, migrationMapping metadata.CollectionNamespaceMapping) *DcpClient {
+func NewDcpClient(dcpDriver *DcpDriver, i int, vbList []uint16, waitGroup *sync.WaitGroup, startVbtsDoneChan chan bool, capabilities metadata.Capability, collectionIds []uint32, colMigrationFilters []string, utils xdcrUtils.UtilsIface, bufferCap int) *DcpClient {
 	return &DcpClient{
 		Name:                fmt.Sprintf("%v_%v", dcpDriver.Name, i),
 		dcpDriver:           dcpDriver,
@@ -72,7 +70,6 @@ func NewDcpClient(dcpDriver *DcpDriver, i int, vbList []uint16, waitGroup *sync.
 		colMigrationFilters: colMigrationFilters,
 		utils:               utils,
 		bufferCap:           bufferCap,
-		migrationMapping:    migrationMapping,
 	}
 }
 
@@ -220,7 +217,7 @@ func initializeClusterWithSecurity(dcpDriver *DcpDriver) (*gocb.Cluster, error) 
 	clusterOpts := gocb.ClusterOptions{}
 
 	if dcpDriver.ref.HttpAuthMech() == xdcrBase.HttpAuthMechHttps {
-		tlsCert := tls.Certificate{Certificate: [][]byte{dcpDriver.ref.Certificates()}}
+		tlsCert := tls.Certificate{Certificate: [][]byte{dcpDriver.ref.Certificate()}}
 		clusterOpts.Authenticator = gocb.CertificateAuthenticator{ClientCertificate: &tlsCert}
 	} else {
 		clusterOpts.Authenticator = gocb.PasswordAuthenticator{
@@ -263,7 +260,7 @@ func initializeBucketWithSecurity(dcpDriver *DcpDriver, kvVbMap map[string][]uin
 	if dcpDriver.ref.HttpAuthMech() == xdcrBase.HttpAuthMechHttps {
 		auth = &base.CertificateAuth{
 			PasswordAuth:     pwAuth,
-			CertificateBytes: dcpDriver.ref.Certificates(),
+			CertificateBytes: dcpDriver.ref.Certificate(),
 		}
 
 		sslPort, found := kvSSLPortMap[bucketConnStr]
@@ -295,8 +292,7 @@ func (c *DcpClient) initializeDcpHandlers() error {
 
 		dcpHandler, err := NewDcpHandler(c, c.dcpDriver.fileDir, i, vbList, c.dcpDriver.numberOfBins,
 			c.dcpDriver.dcpHandlerChanSize, c.dcpDriver.fdPool, c.dcpDriver.IncrementDocReceived,
-			c.dcpDriver.IncrementSysOrUnsubbedEventReceived, c.colMigrationFilters, c.utils, c.bufferCap,
-			c.migrationMapping)
+			c.dcpDriver.IncrementSysEventReceived, c.colMigrationFilters, c.utils, c.bufferCap)
 		if err != nil {
 			c.logger.Errorf("Error constructing dcp handler. err=%v\n", err)
 			return err
@@ -423,7 +419,7 @@ func initializeSSLPorts(dcpDriver *DcpDriver) (map[string]uint16, error) {
 	}
 	// By default the url passed in should be ns_server
 	kvSSLPortMap, err = dcpDriver.utils.GetMemcachedSSLPortMap(connStr, dcpDriver.ref.UserName(),
-		dcpDriver.ref.Password(), dcpDriver.ref.HttpAuthMech(), dcpDriver.ref.Certificates(),
+		dcpDriver.ref.Password(), dcpDriver.ref.HttpAuthMech(), dcpDriver.ref.Certificate(),
 		dcpDriver.ref.SANInCertificate(), dcpDriver.ref.ClientCertificate(), dcpDriver.ref.ClientKey(),
 		dcpDriver.bucketName, dcpDriver.logger, false)
 
@@ -441,7 +437,7 @@ func initializeKVVBMap(dcpDriver *DcpDriver) (map[string][]uint16, error) {
 	}
 
 	_, _, _, _, _, kvVbMap, err = dcpDriver.utils.BucketValidationInfo(connStr, dcpDriver.bucketName, dcpDriver.ref.UserName(),
-		dcpDriver.ref.Password(), dcpDriver.ref.HttpAuthMech(), dcpDriver.ref.Certificates(),
+		dcpDriver.ref.Password(), dcpDriver.ref.HttpAuthMech(), dcpDriver.ref.Certificate(),
 		dcpDriver.ref.SANInCertificate(), dcpDriver.ref.ClientCertificate(), dcpDriver.ref.ClientKey(),
 		dcpDriver.logger)
 

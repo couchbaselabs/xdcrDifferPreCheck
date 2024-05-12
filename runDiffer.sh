@@ -25,19 +25,14 @@ function printHelp() {
 	findExec
 
 	cat <<EOF
-Usage: $0 -u <username> -p <password> -h <hostname:port> -s <sourceBucket> -t <targetBucket> -r <remoteClusterName> [-v <targetUrl>] [-n <remoteClusterUsername> -q <remoteClusterPassword>] [-c clean] [-b ] [-m meta | body | both ] [-e <mutationRetries>] [-w <setupTimeoutInSeconds>] [-d]
+Usage: $0 -u <username> -p <password> -h <hostname:port> -s <sourceBucket> -t <targetBucket> -r <remoteClusterName> [-v <targetUrl>] [-n <remoteClusterUsername> -q <remoteClusterPassword>] [-c clean] [-b ] [-e <mutationRetries>] [-w <setupTimeoutInSeconds>]
 
 This script will set up the necessary environment variable to allow the XDCR diff tool to connect to the metakv service in the
 specified source cluster (NOTE: over http://) and retrieve the specified replication spec and run the difftool on it.
 The difftool currently only supports connecting to remote targets with username and password. Thus, if the specified remote cluster
 reference only contains certificate, then specify the remoteClusterUsername and remoteClusterPassword accordingly.
 
-use "-b" to get document body for comparison. This is equivalent to "-m both". This option will be deprecated in future release.
-use "-m" to specify what to compare during mutationDiff.
- meta (default) will get metadata for comparison. This is faster and includes tombstones.
- body will get document body and only compare the document body. This is slower and does not include tombstones
- both will get document body and compare both document body and metadata. This is slower and does not include tombstones
-use "-d" to enable SDK (gocb) verbose logging along with the xdcrDiffer DEBUG logging. Should be only used for debugging purposes (can be quite spammy)
+use "-b" to get document body for comparison instead of metadata. This is a slower option and it will not get tombstones
 EOF
 }
 
@@ -59,7 +54,7 @@ function killBgTail {
 	fi
 }
 
-while getopts ":h:p:u:r:s:t:n:q:v:cbm:ew:d" opt; do
+while getopts ":h:p:u:r:s:t:n:q:v:cbe:w:" opt; do
 	case ${opt} in
 	u)
 		username=$OPTARG
@@ -89,10 +84,7 @@ while getopts ":h:p:u:r:s:t:n:q:v:cbm:ew:d" opt; do
 		cleanBeforeRun=1
 		;;
 	b)
-		compareType="both"
-		;;
-	m)
-		compareType=$OPTARG
+		compareBody=true
 		;;
 	v)
 		targetUrl=$OPTARG
@@ -195,9 +187,9 @@ if [[ ! -z "$maxFileDescs" ]]; then
 	execString="${execString} -numberOfFileDesc"
 	execString="${execString} $maxFileDescs"
 fi
-if [[ ! -z "$compareType" ]]; then
-	execString="${execString} -compareType"
-	execString="${execString} $compareType"
+if [[ ! -z "$compareBody" ]]; then
+	execString="${execString} -compareBody"
+	execString="${execString} $compareBody"
 fi
 if [[ ! -z "$mutationRetries" ]]; then
 	execString="${execString} -mutationRetries"
@@ -206,10 +198,6 @@ fi
 if [[ ! -z "$setupTimeout" ]]; then
 	execString="${execString} -setupTimeout"
 	execString="${execString} $setupTimeout"
-fi
-if [[ ! -z "$debugMode" ]]; then
-	execString="${execString} -debugMode"
-	execString="${execString} $debugMode"
 fi
 
 # Execute the differ in background and watch the pid to be finished

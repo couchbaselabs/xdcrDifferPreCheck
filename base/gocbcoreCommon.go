@@ -3,7 +3,7 @@ package base
 import (
 	"crypto/tls"
 	"fmt"
-	"github.com/couchbase/gocbcore/v10"
+	"github.com/couchbase/gocbcore/v9"
 	"net/url"
 	"strings"
 	"time"
@@ -91,5 +91,3 @@ func TagCouchbaseSecurePrefix(url *string) {
 		*url = fmt.Sprintf("%v%v", CouchbaseSecurePrefix, *url)
 	}
 }
-
-var ScramShaAuth = []gocbcore.AuthMechanism{gocbcore.ScramSha1AuthMechanism, gocbcore.ScramSha256AuthMechanism, gocbcore.ScramSha512AuthMechanism}

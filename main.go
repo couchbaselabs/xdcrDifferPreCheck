@@ -10,9 +10,6 @@
 package main
 
 import (
-	"crypto/x509"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,20 +17,15 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
-
 	"xdcrDiffer/base"
 	"xdcrDiffer/dcp"
 	"xdcrDiffer/differ"
 	fdp "xdcrDiffer/fileDescriptorPool"
-	"xdcrDiffer/filterPool"
 	"xdcrDiffer/utils"
 
-	"github.com/couchbase/gocbcore/v10"
-	"github.com/couchbase/gocbcore/v10/memd"
 	xdcrBase "github.com/couchbase/goxdcr/base"
 	xdcrParts "github.com/couchbase/goxdcr/base/filter"
 	xdcrLog "github.com/couchbase/goxdcr/log"
@@ -41,8 +33,6 @@ import (
 	"github.com/couchbase/goxdcr/metadata_svc"
 	"github.com/couchbase/goxdcr/service_def"
 	service_def_mock "github.com/couchbase/goxdcr/service_def/mocks"
-	"github.com/couchbase/goxdcr/service_impl"
-	"github.com/couchbase/goxdcr/streamApiWatcher"
 	xdcrUtils "github.com/couchbase/goxdcr/utils"
 	"github.com/stretchr/testify/mock"
 )
@@ -125,8 +115,8 @@ var options struct {
 	enforceTLS bool
 	// Number of items kept in memory per binary buffer bucket
 	bucketBufferCapacity int
-	// Compare metadata, or body, or both
-	compareType string
+	// Use Get instead of GetMeta to compare document body
+	compareBody bool
 	// Number of times for mutationsDiffer to retry to resolve doc differences
 	mutationDifferRetries int
 	// Number of secs to wait between retries
@@ -230,8 +220,8 @@ func argParse() {
 		" stops executing if pre-requisites are not in place to ensure TLS communications")
 	flag.IntVar(&options.bucketBufferCapacity, "bucketBufferCapacity", base.BucketBufferCapacity,
 		"  number of items kept in memory per binary buffer bucket")
-	flag.StringVar(&options.compareType, "compareType", base.MutationCompareTypeMetadata,
-		" whether to compare meta, body, or both. Default meta")
+	flag.BoolVar(&options.compareBody, "compareBody", false,
+		" whether to use Get instead of GetMeta during mutationDiff")
 	flag.IntVar(&options.mutationDifferRetries, "mutationRetries", 0,
 		"Additional number of times to retry to resolve the mutation differences")
 	flag.IntVar(&options.mutationDifferRetriesWaitSecs, "mutationRetriesWaitSecs", 60,
@@ -244,16 +234,6 @@ func argParse() {
 		"Common setup timeout duration in seconds")
 
 	flag.Parse()
-}
-
-func validateCompareType(method string) {
-	for _, str := range base.MutationDiffCompareType {
-		if method == str {
-			return
-		}
-	}
-	fmt.Fprintf(os.Stderr, "Invalid compareType '%v'. Accepted values are %v\n", options.compareType, base.MutationDiffCompareType)
-	os.Exit(1)
 }
 
 func usage() {
@@ -284,17 +264,14 @@ type xdcrDiffTool struct {
 
 	xdcrTopologySvc service_def.XDCRCompTopologySvc
 
-	selfRef             *metadata.RemoteClusterReference
-	selfRefPopulated    uint32
-	specifiedRef        *metadata.RemoteClusterReference
-	specifiedSpec       *metadata.ReplicationSpecification
-	filter              xdcrParts.Filter
-	selfDefaultPoolInfo map[string]interface{}
-	selfPoolsNodes      map[string]interface{}
+	selfRef          *metadata.RemoteClusterReference
+	selfRefPopulated uint32
+	specifiedRef     *metadata.RemoteClusterReference
+	specifiedSpec    *metadata.ReplicationSpecification
+	filter           xdcrParts.Filter
 
-	srcCapabilities  metadata.Capability
-	tgtCapabilities  metadata.Capability
-	srcClusterCompat int
+	srcCapabilities metadata.Capability
+	tgtCapabilities metadata.Capability
 
 	srcBucketManifest *metadata.CollectionsManifest
 	tgtBucketManifest *metadata.CollectionsManifest
@@ -314,10 +291,6 @@ type xdcrDiffTool struct {
 	colFilterOrderedTargetNs    []*xdcrBase.CollectionNamespace
 	colFilterOrderedTargetColId []uint32
 
-	// Used for migration mapping
-	migrationMapping  metadata.CollectionNamespaceMapping
-	duplicatedMapping differ.DuplicatedHintMap
-
 	sourceDcpDriver *dcp.DcpDriver
 	targetDcpDriver *dcp.DcpDriver
 
@@ -335,11 +308,7 @@ func NewDiffTool(legacyMode bool) (*xdcrDiffTool, error) {
 		colFilterToTgtColIdsMap: map[string][]uint32{},
 	}
 
-	logCtx := xdcrLog.DefaultLoggerContext
-	difftool.logger = xdcrLog.NewLogger("xdcrDiffTool", xdcrLog.DefaultLoggerContext)
-	if options.debugMode {
-		logCtx.SetLogLevel(xdcrLog.LogLevelDebug)
-	}
+	difftool.logger = xdcrLog.NewLogger("xdcrDiffTool", nil)
 
 	difftool.selfRef, _ = metadata.NewRemoteClusterReference("", base.SelfReferenceName, options.sourceUrl, options.sourceUsername, options.sourcePassword,
 		"", false, "", nil, nil, nil, nil)
@@ -353,69 +322,31 @@ func NewDiffTool(legacyMode bool) (*xdcrDiffTool, error) {
 		uiLogSvcMock := &service_def_mock.UILogSvc{}
 		uiLogSvcMock.On("Write", mock.Anything).Run(func(args mock.Arguments) { fmt.Printf("%v", args.Get(0).(string)) }).Return(nil)
 		xdcrTopologyMock := &service_def_mock.XDCRCompTopologySvc{}
-		xdcrTopologyMockSetupCb := func() {
-			setupXdcrToplogyMock(xdcrTopologyMock, difftool)
-		}
+		setupXdcrToplogyMock(xdcrTopologyMock, difftool)
+		clusterInfoSvcMock := &service_def_mock.ClusterInfoSvc{}
 		resolverSvcMock := &service_def_mock.ResolverSvcIface{}
 		checkpointSvcMock := &service_def_mock.CheckpointsService{}
 		manifestsSvcMock := &service_def_mock.ManifestsService{}
 		manifestsSvcMock.On("GetSourceManifests", mock.Anything).Return(nil, service_def.MetadataNotFoundErr)
 		manifestsSvcMock.On("GetTargetManifests", mock.Anything).Return(nil, service_def.MetadataNotFoundErr)
 
-		replicationSettingSvc := metadata_svc.NewReplicationSettingsSvc(difftool.metadataSvc, nil, xdcrTopologyMock)
-
 		difftool.remoteClusterSvc, err = metadata_svc.NewRemoteClusterService(uiLogSvcMock, difftool.metadataSvc, xdcrTopologyMock,
-			xdcrLog.DefaultLoggerContext, difftool.utils)
+			clusterInfoSvcMock, xdcrLog.DefaultLoggerContext, difftool.utils)
 		if err != nil {
-			return nil, err
-		}
-
-		if err = difftool.retrieveClustersCapabilities(legacyMode, xdcrTopologyMockSetupCb); err != nil {
 			return nil, err
 		}
 
 		difftool.replicationSpecSvc, err = metadata_svc.NewReplicationSpecService(uiLogSvcMock, difftool.remoteClusterSvc,
-			difftool.metadataSvc, xdcrTopologyMock, resolverSvcMock, difftool.logger.LoggerContext(), difftool.utils,
-			replicationSettingSvc)
+			difftool.metadataSvc, xdcrTopologyMock, clusterInfoSvcMock,
+			resolverSvcMock, difftool.logger.LoggerContext(), difftool.utils)
 		if err != nil {
 			return nil, err
 		}
-
-		err = difftool.retrieveReplicationSpecInfo()
-		if err != nil {
-			return nil, err
-		}
-
-		securitySvc := &service_def_mock.SecuritySvc{}
-		setupSecuritySvcMock(securitySvc)
-		err = setupMyKVNodes(xdcrTopologyMock, difftool)
-		if err != nil {
-			return nil, err
-		}
-
-		bucketTopologySvc, err := service_impl.NewBucketTopologyService(xdcrTopologyMock, difftool.remoteClusterSvc,
-			difftool.utils, xdcrBase.TopologyChangeCheckInterval, difftool.logger.LoggerContext(),
-			difftool.replicationSpecSvc, xdcrBase.HealthCheckInterval, securitySvc, streamApiWatcher.GetStreamApiWatcher)
 
 		difftool.collectionsManifestsSvc, err = metadata_svc.NewCollectionsManifestService(difftool.remoteClusterSvc,
 			difftool.replicationSpecSvc, uiLogSvcMock, difftool.logger.LoggerContext(), difftool.utils, checkpointSvcMock,
-			xdcrTopologyMock, bucketTopologySvc, manifestsSvcMock)
+			xdcrTopologyMock, manifestsSvcMock)
 		if err != nil {
-			return nil, err
-		}
-
-		difftool.logger.Infof("Source cluster supports collections: %v Target cluster supports collections: %v\n",
-			difftool.srcCapabilities.HasCollectionSupport(), difftool.tgtCapabilities.HasCollectionSupport())
-
-		if difftool.srcCapabilities.HasCollectionSupport() || difftool.tgtCapabilities.HasCollectionSupport() {
-			err = difftool.populateCollectionsPreReq()
-			if err != nil {
-				return nil, err
-			}
-		}
-	} else {
-		// Need to do this outside of legacy mode
-		if err := difftool.retrieveClustersCapabilities(legacyMode, nil); err != nil {
 			return nil, err
 		}
 	}
@@ -426,68 +357,11 @@ func NewDiffTool(legacyMode bool) (*xdcrDiffTool, error) {
 	return difftool, err
 }
 
-func setupSecuritySvcMock(securitySvc *service_def_mock.SecuritySvc) {
-	securitySvc.On("IsClusterEncryptionLevelStrict").Return(false)
-}
-
 // This may be re-set up once self-reference is populated
 func setupXdcrToplogyMock(xdcrTopologyMock *service_def_mock.XDCRCompTopologySvc, diffTool *xdcrDiffTool) {
 	xdcrTopologyMock.On("IsMyClusterEnterprise").Return(true, nil)
-	xdcrTopologyMock.On("IsKVNode").Return(true, nil)
-	xdcrTopologyMock.On("IsMyClusterEncryptionLevelStrict").Return(false)
-	xdcrTopologyMock.On("MyClusterCompatibility").Return(diffTool.srcClusterCompat, nil)
 	setupTopologyMockCredentials(xdcrTopologyMock, diffTool)
 	setupTopologyMockConnectionString(xdcrTopologyMock, diffTool)
-}
-
-func setupMyKVNodes(topologyMock *service_def_mock.XDCRCompTopologySvc, diffTool *xdcrDiffTool) error {
-	// As of XDCR v8, pools/nodes endpoint is gone so we need to do things the legacy way
-	nodesInfo := diffTool.selfPoolsNodes
-	if nodes, ok := nodesInfo[base.NodesKey]; !ok {
-		return fmt.Errorf("%v is not found from pools/nodes output", base.NodesKey)
-	} else if nodesList, ok := nodes.([]interface{}); !ok {
-		return fmt.Errorf("nodesList is not an interface list")
-	} else {
-		var found bool
-		for _, node := range nodesList {
-			nodeInfoMap, ok := node.(map[string]interface{})
-			if !ok {
-				// should never get here
-				return fmt.Errorf("node type is %v", reflect.TypeOf(node))
-			}
-			thisNode, ok := nodeInfoMap[xdcrBase.ThisNodeKey]
-			if ok {
-				thisNodeBool, ok := thisNode.(bool)
-				if !ok {
-					// should never get here
-					return fmt.Errorf("thisNode is %v", reflect.TypeOf(thisNode))
-				}
-				if thisNodeBool {
-					// found current node
-					found = true
-				}
-			}
-			if found {
-				ports := nodeInfoMap[xdcrBase.PortsKey]
-				portsMap := ports.(map[string]interface{})
-				directPort := portsMap[xdcrBase.DirectPortKey]
-				directPortFloat := directPort.(float64)
-				memcachedPort := uint16(directPortFloat)
-
-				hostAddr := nodeInfoMap[xdcrBase.HostNameKey]
-				hostAddrStr := hostAddr.(string)
-
-				hostName := xdcrBase.GetHostName(hostAddrStr)
-				memcachedAddr := xdcrBase.GetHostAddr(hostName, memcachedPort)
-				topologyMock.On("MyKVNodes").Return([]string{memcachedAddr}, nil)
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("Unable to set memcached port")
-		}
-	}
-	return nil
 }
 
 func setupTopologyMockConnectionString(xdcrTopologyMock *service_def_mock.XDCRCompTopologySvc, diffTool *xdcrDiffTool) {
@@ -535,7 +409,7 @@ func setupTopologyMockCredentials(xdcrTopologyMock *service_def_mock.XDCRCompTop
 	}
 	getCert := func() []byte {
 		if atomic.LoadUint32(&diffTool.selfRefPopulated) == 1 {
-			return diffTool.selfRef.Certificates()
+			return diffTool.selfRef.Certificate()
 		} else {
 			return nil
 		}
@@ -578,389 +452,54 @@ func maybeSetEnv(key, value string) {
 	os.Setenv(key, value)
 }
 
-type SubdocMutationPathSpec struct {
-	opcode uint8
-	flags  uint8
-	path   []byte
-	value  []byte
-}
-
-func HexLittleEndianToUint64(hexLE []byte) (uint64, error) {
-	if len(hexLE) <= 2 {
-		return 0, fmt.Errorf("hex input value %s is too short. Leading 0x is expected", hexLE)
-	}
-	if hexLE[0] != '0' || hexLE[1] != 'x' {
-		return 0, fmt.Errorf("incorrect hex little endian input %s", hexLE)
-	}
-
-	// Decoding the hexLE will need the string to be of even length
-	// If hexLE is not of even length, it was probably stripped off of zeroes at the end as part of Uint64ToHexLittleEndianAndStrip
-	if len(hexLE)%2 != 0 {
-		// note that this will not allocate a new slice, but will overwrite the " to a 0 from the underlying array
-		// this is because the original xattr would have been abc"0x123"xyz - which will change to abc"0x1230xyz
-		// hence safe
-		hexLE = append(hexLE, '0')
-	}
-
-	// 16 is the max size of the hex string for uint64 decoding
-	// hexLE may not necessarily be 16+2 bytes because of Uint64ToHexLittleEndianAndStrip0s
-	decoded := make([]byte, 16)
-	_, err := hex.Decode(decoded, hexLE[2:])
-	if err != nil {
-		return 0, err
-	}
-	res := binary.LittleEndian.Uint64(decoded)
-	return res, nil
-}
-
-func Uint64ToHexLittleEndian(u64 uint64) []byte {
-	le := make([]byte, 8)
-	binary.LittleEndian.PutUint64(le, u64)
-	encoded := make([]byte, hex.EncodedLen(8)+2)
-	hex.Encode(encoded[2:], le)
-	encoded[0] = '0'
-	encoded[1] = 'x'
-	return encoded
-}
-
-// strips 0s from the end of the resultant hex little endian string
-func Uint64ToHexLittleEndianAndStrip0s(u64 uint64) []byte {
-	hexLE := Uint64ToHexLittleEndian(u64)
-
-	// theoritically,
-	// 0x0 is numerically the least output
-	// 0xffffffffffffffff being the highest
-	idx := len(hexLE) - 1
-	for ; idx > 2 && hexLE[idx] == '0'; idx-- {
-	}
-
-	return hexLE[:idx+1]
-}
-func (spec *SubdocMutationPathSpec) size() int {
-	// 1B opcode, 1B flags, 2B path len, 4B value len
-	return 8 + len(spec.path) + len(spec.value)
-}
-
 func main() {
-	gocbcore.SetLogger(gocbcore.VerboseStdioLogger())
-	agentConfig := &gocbcore.AgentConfig{
-		SeedConfig: gocbcore.SeedConfig{MemdAddrs: []string{"127.0.0.1:12000"}},
-		BucketName: "B1",
-		UserAgent:  fmt.Sprintf("xdcrDifferCheckpointMgr"),
-		SecurityConfig: gocbcore.SecurityConfig{
-			UseTLS:            false,
-			TLSRootCAProvider: func() *x509.CertPool { return nil },
-			Auth:              gocbcore.PasswordAuthProvider{Username: "Administrator", Password: "wewewe"},
-			AuthMechanisms:    base.ScramShaAuth,
-		},
-		IoConfig: gocbcore.IoConfig{UseCollections: true},
-	}
+	argParse()
 
-	agent, err := gocbcore.CreateAgent(agentConfig)
+	base.SetupTimeoutSeconds = options.setupTimeout
+
+	fmt.Printf("differ is run with options: %+v\n", options)
+	legacyMode := len(options.targetUsername) > 0
+
+	difftool, err := NewDiffTool(legacyMode)
 	if err != nil {
-		fmt.Printf("ERR1=%v\n", err)
+		fmt.Printf("Error creating difftool: %v\n", err)
+		os.Exit(1)
 	}
 
-	options := gocbcore.WaitUntilReadyOptions{
-		DesiredState:  gocbcore.ClusterStateOnline,
-		ServiceTypes:  []gocbcore.ServiceType{gocbcore.MemdService},
-		RetryStrategy: &base.RetryStrategy{},
+	if options.enforceTLS {
+		// For using certificates, the source cluster must be on a loopback device since we will be retrieving the
+		// source cluster's certificate to prevent sniffing
+		if !isURLLoopBack(options.sourceUrl) {
+			fmt.Printf("enforceTLS options requires that source addr %v to use loopback device\n", options.sourceUrl)
+			os.Exit(1)
+		}
 	}
 
-	signal := make(chan error, 1)
-	_, err = agent.WaitUntilReady(time.Now().Add(15*time.Second),
-		options, func(res *gocbcore.WaitUntilReadyResult, er error) {
-			signal <- er
-		})
-
-	if err == nil {
-		fmt.Printf("ERR2=%v\n", err)
-		err = <-signal
+	if !legacyMode {
+		if err := difftool.retrieveReplicationSpecInfo(); err != nil {
+			os.Exit(1)
+		}
+	} else {
+		if options.enforceTLS {
+			fmt.Printf("enforceTLS option is not compatible with legacyMode")
+			os.Exit(1)
+		}
+		// OK to ignore metakv err in manual mode
+		if err := difftool.populateTemporarySpecAndRef(); err != nil {
+			fmt.Printf("%v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	// body := []byte("{\"foo290\":\"bar119\"}")
-	ch := make(chan bool)
-
-	// tgtCluster, err := gocb.Connect("couchbase://127.0.0.1:12000", gocb.ClusterOptions{Authenticator: gocb.PasswordAuthenticator{
-	// 	Username: "Administrator",
-	// 	Password: "wewewe",
-	// }})
-	// defer tgtCluster.Close(nil)
-	// if err != nil {
-	// 	fmt.Printf("Err=%v\n", err)
-	// 	return
-	// }
-	// err = tgtCluster.WaitUntilReady(15*time.Second, nil)
-	// if err != nil {
-	// 	return
-	// }
-	// bucket := tgtCluster.Bucket("B1")
-	// err = bucket.WaitUntilReady(20*time.Second, &gocb.WaitUntilReadyOptions{DesiredState: gocb.ClusterStateOnline})
-	// if err != nil {
-	// 	fmt.Printf("TestImportForCasRollbackCase skipped because bucket is cannot be created. Error: %v\n", err)
-	// 	return
-	// }
-	// var specs []gocb.MutateInSpec
-	// spec, err :=
-	// res, err := bucket.DefaultCollection().MutateIn("mobileDoc", []gocb.MutateInSpec{
-	// 	gocb.UpsertSpec("_sumukh", "raju bhat???", &gocb.UpsertSpecOptions{CreatePath: true, IsXattr: true}),
-	// 	// gocb.RemoveSpec("", &gocb.RemoveSpecOptions{IsXattr: false}),
-	// }, &gocb.MutateInOptions{})
-	// fmt.Printf("cas=%v, err=%v\n", res.Result.Cas(), err)
-	// return
-	// var CAS uint64 = 0
-	// agent.LookupIn(
-	// 	gocbcore.LookupInOptions{
-	// 		Key:   []byte("common0"),
-	// 		Flags: memd.SubdocDocFlagAccessDeleted,
-	// 		Ops: []gocbcore.SubDocOp{
-	// 			gocbcore.SubDocOp{
-	// 				Op:    memd.SubDocOpType(memd.CmdSubDocGet),
-	// 				Flags: memd.SubdocFlag(0x04),
-	// 				Path:  "_vv.pv",
-	// 				Value: nil,
-	// 			},
-	// 		},
-	// 	},
-	// 	func(mir *gocbcore.LookupInResult, err error) {
-	// 		if err == nil {
-	// 			CAS = uint64(mir.Cas)
-	// 			fmt.Printf("MIRCAS=%v, MIRSEQNO=%v, MIROps=%v, err=%v\n", CAS, mir.Internal.IsDeleted, mir.Ops, err)
-	// 		} else {
-	// 			fmt.Printf("Error occured=%v\n", err)
-	// 		}
-	// 		ch <- true
-	// 	},
-	// )
-	// <-ch
-	// fmt.Printf("CAS=%v\n", CAS)
-
-	// h := xdcrBase.Uint64ToHexLittleEndian(CAS)
-	//[Dr8iIdfJrtny6H5u3HRg0w:1714394294054420480 src1:1714394430554255000 src2:1714394430554256000]
-
-	// fmt.Printf("SUMUKH DEBUG ---- %s\n", Uint64ToHexLittleEndian(1715339963446132736))
-	// now := time.Now().UnixNano()
-	// now1 := now - (time.Duration(721 * time.Hour).Nanoseconds())
-	// now2 := now - 2000
-	// now3 := now - 1000
-	// h1 := Uint64ToHexLittleEndianAndStrip0s(uint64(now1))
-	// h2 := Uint64ToHexLittleEndianAndStrip0s(uint64(now2 - now1))
-	// h3 := Uint64ToHexLittleEndianAndStrip0s(uint64(now3 - now2))
-	// fmt.Printf("SUMUKH DEBUG new values now=%v, now1=%v, now2=%v, now3=%v, n2-n1=%v, n3-n2=%v, h1=%s, h2=%s, h3=%s\n", now, now1, now2, now3, now2-now1, now3-now2, h1, h2, h3)
-
-	// 	SUMUKH DEBUG path=_vv.cvCas, val="${Mutation.CAS}", flag=21, op=200, targetPv=true
-	// SUMUKH DEBUG path=_vv.src, val="9BT6s2f+DKkqBFTZtHYyHQ", flag=5, op=200, targetPv=true
-	// SUMUKH DEBUG path=_vv.ver, val="0x00007189351ace17", flag=5, op=200, targetPv=true
-	// SUMUKH DEBUG path=_vv.pv, val=, flag=4, op=201, targetPv=true
-	// SUMUKH DEBUG path=, val={"name": "common114", "age": 13, "index": "114", "body":"0000000000"}, flag=0, op=1, targetPv=true
-	done := false
-	for i := 0; !done && i < 100; i++ {
-		time.Sleep(2 * time.Second)
-		agent.MutateIn(
-			gocbcore.MutateInOptions{
-				Cas: 12345,
-				Key: []byte("aaa"),
-				// Flags: memd.SubdocDocFlagAccessDeleted,
-				Ops: []gocbcore.SubDocOp{
-					// {
-					// 	Op:    memd.SubDocOpType(memd.CmdSet),
-					// 	Flags: 0,
-					// 	Path:  "",
-					// 	Value: []byte("{\"sumukh\":\"bhat\"}"),
-					// },
-					// // {
-					// // 	Op:    memd.SubDocOpType(memd.SubDocOpDictSet),
-					// // 	Flags: memd.SubdocFlag(0x01 | 0x04),
-					// // 	Path:  "_vv.sumukh_bhat",
-					// // 	Value: []byte(fmt.Sprintf(`{"src":"%s","src1":"%s","src2":"%s"}`, h1, h2, h3)),
-					// // },
-					// {
-					// 	Op:    memd.SubDocOpType(memd.CmdSubDocDelete),
-					// 	Flags: memd.SubdocFlag(0x04),
-					// 	Path:  "_vv.pv",
-					// 	Value: nil,
-					// },
-					{
-						Op:    200,
-						Flags: 0x10 | 0x4 | 0x1,
-						Path:  "_vv.cvCas",
-						Value: []byte(`"${Mutation.CAS}"`),
-					},
-					{
-						Op:    200,
-						Flags: 5,
-						Path:  "_vv.srcs",
-						Value: []byte(`"9BT6s2f+DKkqBFTZtHYyHQ"`),
-					},
-					{
-						Op:    200,
-						Flags: 5,
-						Path:  "_vv.ver",
-						Value: []byte(`"0x00007189351ace17"`),
-					},
-					// {
-					// 	Op:    201,
-					// 	Flags: 4,
-					// 	Path:  "_vv.pv",
-					// 	Value: nil,
-					// },
-					{
-						Op:    1,
-						Flags: 0,
-						Path:  "",
-						Value: []byte(`{"name": "common114", "age": 13, "index": "114", "body":"0000000000"}`),
-					},
-				},
-			},
-			func(mir *gocbcore.MutateInResult, err error) {
-				if err == nil {
-					fmt.Printf("MIRCAS=%v, MIRSEQNO=%v, MIROps=%v, err=%v\n", mir.Cas, mir.MutationToken.SeqNo, mir.Ops, err)
-					for j := 0; j < 4; j++ {
-						fmt.Printf("SUMUKH DEBUG mirErr=%v\n", mir.Ops[j].Err)
-					}
-				} else {
-					done = true
-					fmt.Printf("Error occured=%v\n", err)
-				}
-				ch <- true
-			},
-		)
-		<-ch
-
-		agent.LookupIn(
-			gocbcore.LookupInOptions{
-				Key:   []byte("aaa"),
-				Flags: memd.SubdocDocFlagAccessDeleted,
-				Ops: []gocbcore.SubDocOp{
-					gocbcore.SubDocOp{
-						Op:    memd.SubDocOpType(memd.CmdSubDocGet),
-						Flags: memd.SubdocFlag(0x04),
-						Path:  "_vv.cvCas",
-						Value: nil,
-					},
-				},
-			},
-			func(mir *gocbcore.LookupInResult, err error) {
-				if err == nil {
-					CAS := uint64(mir.Cas)
-					fmt.Printf("MIRCAS=%v, MIRSEQNO=%v, MIROps=%v, err=%v\n", CAS, mir.Internal.IsDeleted, mir.Ops, err)
-					fmt.Printf("SUMUKH DEBUG err=%v\n", mir.Ops[0].Err)
-					hex := mir.Ops[0].Value
-					cvCas, err := HexLittleEndianToUint64(hex[1 : len(hex)-1])
-					fmt.Printf("SUMUKH DEBUG2 err=%v\n", err)
-					if cvCas != CAS {
-						panic(fmt.Sprintf("cas=%v != cvCas=%v", CAS, cvCas))
-					}
-				} else {
-					done = true
-					fmt.Printf("Error occured=%v\n", err)
-				}
-				ch <- true
-			},
-		)
-		<-ch
+	if err := setupDirectories(); err != nil {
+		difftool.logger.Errorf("Unable to set up directory structure: %v\n", err)
+		os.Exit(1)
 	}
 
-	// if err != nil {
-	// 	err1 := agent.Close()
-	// 	fmt.Printf("Actual error in ckptMgr=%v, error while closing agent=%v\n", err, err1)
-	// 	return
-	// }
-	// fmt.Printf("SUMUKH DEBUG Succussful\n")
-
-	// agent.Set(
-	// 	gocbcore.SetOptions{
-	// 		Key:   []byte("mobile1"),
-	// 		Value: body,
-	// 		// Flags:          0x08, //| 0x04,
-	// 		ScopeName:      "_default",
-	// 		CollectionName: "_default",
-	// 		Datatype:       0x01,
-	// 	},
-	// 	func(sr *gocbcore.StoreResult, err error) {
-	// 		fmt.Printf("SRCAS=%v, ERR=%v\n", sr.Cas, err)
-	// 		ch <- true
-	// 	},
-	// )
-
-	// extras := make([]byte, 28)
-	// var opts uint32
-	// opts |= 0x08
-	// opts |= 0x02
-	// binary.BigEndian.PutUint32(extras[24:28], opts)
-	// agent.SetMeta(gocbcore.SetMetaOptions{
-	// 	Cas:   0,
-	// 	Key:   []byte("importDoc"),
-	// 	Value: []byte("{\"hi\":\"hello\"}"),
-	// 	// Extra: extras,
-	// 	Options: opts,
-	// 	CRCas:   math.MaxUint64 - 1,
-	// },
-	// 	func(smr *gocbcore.SetMetaResult, err error) {
-	// 		fmt.Printf("smr=%v, err=%v\n", smr, err)
-	// 		ch <- true
-	// 	},
-	// )
-	// agent.SetMeta(gocbcore.SetMetaOptions{
-	// 	Cas:   0,
-	// 	Key:   []byte("importDoc1"),
-	// 	Value: []byte("{\"hi\":\"hello\"}"),
-	// 	// Extra: extras,
-	// 	Options:        opts,
-	// 	CRCas:          math.MaxUint64 - 2,
-	// 	ScopeName:      "_default",
-	// 	CollectionName: "_default",
-	// },
-	// 	func(smr *gocbcore.SetMetaResult, err error) {
-	// 		fmt.Printf("smr=%v, err=%v\n", smr, err)
-	// 		ch <- true
-	// 	},
-	// )
-	// <-ch
-	// argParse()
-
-	// // if options.debugMode {
-	// gocb.SetLogger(gocb.VerboseStdioLogger())
-	// // }
-
-	// base.SetupTimeoutSeconds = options.setupTimeout
-
-	// validateCompareType(options.compareType)
-
-	// fmt.Printf("differ is run with options: %+v\n", options)
-	// legacyMode := len(options.targetUsername) > 0
-
-	// if err := setupDirectories(); err != nil {
-	// 	fmt.Printf("Unable to set up directory structure: %v\n", err)
-	// 	os.Exit(1)
-	// }
-
-	// difftool, err := NewDiffTool(legacyMode)
-	// if err != nil {
-	// 	fmt.Printf("Error creating difftool: %v\n", err)
-	// 	os.Exit(1)
-	// }
-
-	// if options.enforceTLS {
-	// 	// For using certificates, the source cluster must be on a loopback device since we will be retrieving the
-	// 	// source cluster's certificate to prevent sniffing
-	// 	if !isURLLoopBack(options.sourceUrl) {
-	// 		fmt.Printf("enforceTLS options requires that source addr %v to use loopback device\n", options.sourceUrl)
-	// 		os.Exit(1)
-	// 	}
-	// }
-
-	// if legacyMode {
-	// 	if options.enforceTLS {
-	// 		fmt.Printf("enforceTLS option is not compatible with legacyMode")
-	// 		os.Exit(1)
-	// 	}
-	// 	// OK to ignore metakv err in manual mode
-	// 	if err := difftool.populateTemporarySpecAndRef(); err != nil {
-	// 		fmt.Printf("%v\n", err)
-	// 		os.Exit(1)
-	// 	}
-	// }
+	if err := difftool.retrieveClustersCapabilities(legacyMode); err != nil {
+		fmt.Printf("%v\n", err)
+		os.Exit(1)
+	}
 
 	// if options.runDataGeneration {
 	// 	err := difftool.generateDataFiles()
@@ -1012,26 +551,26 @@ func setupDirectories() error {
 	return nil
 }
 
-func (difftool *xdcrDiffTool) createFilter() error {
+func (difftool *xdcrDiffTool) createFilterIfNecessary() error {
 	var ok bool
 	var expr string
 	expr, ok = difftool.specifiedSpec.Settings.Values[metadata.FilterExpressionKey].(string)
-	filterMode := difftool.specifiedSpec.Settings.GetExpDelMode()
-	if ok && len(expr) > 0 {
-		var filterVersion xdcrBase.FilterVersionType
-		if filterVersion, ok = difftool.specifiedSpec.Settings.Values[metadata.FilterVersionKey].(xdcrBase.FilterVersionType); !ok {
-			err := fmt.Errorf("Unable to find filter version given filter expression %v\nsettings:%v\n", expr, difftool.specifiedSpec.Settings)
-			return err
-		}
-
-		if filterVersion == xdcrBase.FilterVersionKeyOnly {
-			expr = xdcrBase.UpgradeFilter(expr)
-		}
-		difftool.logger.Infof("Found filtering expression: %v\n", expr)
+	if !ok || len(expr) == 0 {
+		return nil
 	}
-	mobileCompat := difftool.specifiedSpec.Settings.GetMobileCompatible()
 
-	filter, err := filterPool.NewFilterPool(options.numOfFiltersInFilterPool, expr, difftool.utils, filterMode, mobileCompat)
+	var filterVersion xdcrBase.FilterVersionType
+	if filterVersion, ok = difftool.specifiedSpec.Settings.Values[metadata.FilterVersionKey].(xdcrBase.FilterVersionType); !ok {
+		err := fmt.Errorf("Unable to find filter version given filter expression %v\nsettings:%v\n", expr, difftool.specifiedSpec.Settings)
+		return err
+	}
+
+	if filterVersion == xdcrBase.FilterVersionKeyOnly {
+		expr = xdcrBase.UpgradeFilter(expr)
+	}
+	difftool.logger.Infof("Found filtering expression: %v\n", expr)
+
+	filter, err := xdcrParts.NewFilter("XDCRDiffToolFilter", expr, difftool.utils)
 	difftool.filter = filter
 	return err
 }
@@ -1053,7 +592,7 @@ func (difftool *xdcrDiffTool) generateDataFiles() error {
 		fileDescPool = fdp.NewFileDescriptorPool(int(options.numberOfFileDesc))
 	}
 
-	if err := difftool.createFilter(); err != nil {
+	if err := difftool.createFilterIfNecessary(); err != nil {
 		difftool.logger.Errorf("Error creating filter: %v", err.Error())
 		os.Exit(1)
 	}
@@ -1064,8 +603,7 @@ func (difftool *xdcrDiffTool) generateDataFiles() error {
 		options.numberOfWorkersPerSourceDcpClient, options.numberOfBins, options.sourceDcpHandlerChanSize,
 		options.bucketOpTimeout, options.maxNumOfGetStatsRetry, options.getStatsRetryInterval,
 		options.getStatsMaxBackoff, options.checkpointInterval, errChan, waitGroup, options.completeBySeqno, fileDescPool, difftool.filter,
-		difftool.srcCapabilities, difftool.srcCollectionIds, difftool.colFilterOrderedKeys, difftool.utils, options.bucketBufferCapacity,
-		difftool.migrationMapping, difftool.specifiedSpec.Settings.GetMobileCompatible(), difftool.specifiedSpec.Settings.GetExpDelMode())
+		difftool.srcCapabilities, difftool.srcCollectionIds, difftool.colFilterOrderedKeys, difftool.utils, options.bucketBufferCapacity)
 
 	delayDurationBetweenSourceAndTarget := time.Duration(options.delayBetweenSourceAndTarget) * time.Second
 	difftool.logger.Infof("Waiting for %v before starting target dcp clients\n", delayDurationBetweenSourceAndTarget)
@@ -1078,8 +616,7 @@ func (difftool *xdcrDiffTool) generateDataFiles() error {
 		options.numberOfTargetDcpClients, options.numberOfWorkersPerTargetDcpClient, options.numberOfBins, options.targetDcpHandlerChanSize,
 		options.bucketOpTimeout, options.maxNumOfGetStatsRetry, options.getStatsRetryInterval, options.getStatsMaxBackoff,
 		options.checkpointInterval, errChan, waitGroup, options.completeBySeqno, fileDescPool, difftool.filter,
-		difftool.tgtCapabilities, difftool.tgtCollectionIds, difftool.colFilterOrderedKeys, difftool.utils, options.bucketBufferCapacity,
-		difftool.migrationMapping, difftool.specifiedSpec.Settings.GetMobileCompatible(), difftool.specifiedSpec.Settings.GetExpDelMode())
+		difftool.tgtCapabilities, difftool.tgtCollectionIds, difftool.colFilterOrderedKeys, difftool.utils, options.bucketBufferCapacity)
 
 	difftool.curState.mtx.Lock()
 	difftool.curState.state = StateDcpStarted
@@ -1136,12 +673,11 @@ func (difftool *xdcrDiffTool) diffDataFiles() error {
 			}
 		}
 	}
-	difftool.duplicatedMapping = difftoolDriver.DuplicatedHint
 	return err
 }
 
 func (difftool *xdcrDiffTool) runMutationDiffer() {
-	difftool.logger.Infof("runMutationDiffer started with compareBody=%v\n", options.compareType)
+	difftool.logger.Infof("runMutationDiffer started with compareBody=%v\n", options.compareBody)
 	defer difftool.logger.Infof("runMutationDiffer completed\n")
 
 	err := os.RemoveAll(options.mutationDifferDir)
@@ -1159,23 +695,23 @@ func (difftool *xdcrDiffTool) runMutationDiffer() {
 		options.fileDifferDir, options.mutationDifferDir, int(options.numberOfWorkersForMutationDiffer),
 		int(options.mutationDifferBatchSize), int(options.mutationDifferTimeout), int(options.maxNumOfSendBatchRetry),
 		time.Duration(options.sendBatchRetryInterval)*time.Millisecond,
-		time.Duration(options.sendBatchMaxBackoff)*time.Second, options.compareType, difftool.logger, difftool.srcToTgtColIdsMap,
+		time.Duration(options.sendBatchMaxBackoff)*time.Second, options.compareBody, difftool.logger, difftool.srcToTgtColIdsMap,
 		difftool.srcCapabilities, difftool.tgtCapabilities, difftool.utils, options.mutationDifferRetries,
-		options.mutationDifferRetriesWaitSecs, difftool.duplicatedMapping)
+		options.mutationDifferRetriesWaitSecs)
 	err = mutationDiffer.Run()
 	if err != nil {
 		difftool.logger.Errorf("Error from runMutationDiffer = %v\n", err)
 	}
 }
 
-func startDcpDriver(logger *xdcrLog.CommonLogger, name, url, bucketName string, ref *metadata.RemoteClusterReference, fileDir, checkpointFileDir, oldCheckpointFileName, newCheckpointFileName string, numberOfDcpClients, numberOfWorkersPerDcpClient, numberOfBins, dcpHandlerChanSize, bucketOpTimeout, maxNumOfGetStatsRetry, getStatsRetryInterval, getStatsMaxBackoff, checkpointInterval uint64, errChan chan error, waitGroup *sync.WaitGroup, completeBySeqno bool, fdPool fdp.FdPoolIface, filter xdcrParts.Filter, capabilities metadata.Capability, collectionIDs []uint32, colMigrationFilters []string, utils xdcrUtils.UtilsIface, bucketBufferCap int, migrationMapping metadata.CollectionNamespaceMapping, mobileCompat int, expDelMode xdcrBase.FilterExpDelType) *dcp.DcpDriver {
+func startDcpDriver(logger *xdcrLog.CommonLogger, name, url, bucketName string, ref *metadata.RemoteClusterReference, fileDir, checkpointFileDir, oldCheckpointFileName, newCheckpointFileName string, numberOfDcpClients, numberOfWorkersPerDcpClient, numberOfBins, dcpHandlerChanSize, bucketOpTimeout, maxNumOfGetStatsRetry, getStatsRetryInterval, getStatsMaxBackoff, checkpointInterval uint64, errChan chan error, waitGroup *sync.WaitGroup, completeBySeqno bool, fdPool fdp.FdPoolIface, filter xdcrParts.Filter, capabilities metadata.Capability, collectionIDs []uint32, colMigrationFilters []string, utils xdcrUtils.UtilsIface, bucketBufferCap int) *dcp.DcpDriver {
 	waitGroup.Add(1)
 	dcpDriver := dcp.NewDcpDriver(logger, name, url, bucketName, ref, fileDir, checkpointFileDir, oldCheckpointFileName,
 		newCheckpointFileName, int(numberOfDcpClients), int(numberOfWorkersPerDcpClient), int(numberOfBins),
 		int(dcpHandlerChanSize), time.Duration(bucketOpTimeout)*time.Second, int(maxNumOfGetStatsRetry),
 		time.Duration(getStatsRetryInterval)*time.Second, time.Duration(getStatsMaxBackoff)*time.Second,
 		int(checkpointInterval), errChan, waitGroup, completeBySeqno, fdPool, filter, capabilities, collectionIDs, colMigrationFilters,
-		utils, bucketBufferCap, migrationMapping, mobileCompat, expDelMode)
+		utils, bucketBufferCap)
 	// dcp driver startup may take some time. Do it asynchronously
 	go startDcpDriverAysnc(dcpDriver, errChan, logger)
 	return dcpDriver
@@ -1241,6 +777,19 @@ func (difftool *xdcrDiffTool) waitForDuration(sourceDcpDriver, targetDcpDriver *
 func (difftool *xdcrDiffTool) retrieveReplicationSpecInfo() error {
 	// CBAUTH has already been setup
 	var err error
+	difftool.specifiedRef, err = difftool.remoteClusterSvc.RemoteClusterByRefName(options.remoteClusterName, true /*refresh*/)
+	if err != nil {
+		for err != nil && err == metadata_svc.RefreshNotEnabledYet {
+			difftool.logger.Infof("Difftool hasn't finished reaching out to remote cluster. Sleeping 5 seconds and retrying...")
+			time.Sleep(5 * time.Second)
+			difftool.specifiedRef, err = difftool.remoteClusterSvc.RemoteClusterByRefName(options.remoteClusterName, true /*refresh*/)
+		}
+		if err != nil {
+			difftool.logger.Errorf("Error retrieving remote clusters: %v\n", err)
+			return err
+		}
+	}
+
 	if options.enforceTLS && !difftool.specifiedRef.IsHttps() {
 		err = fmt.Errorf("enforceTLS requires that the remote cluster reference %v to use Full-Encryption mode", difftool.specifiedRef.Name())
 		difftool.logger.Errorf(err.Error())
@@ -1277,7 +826,8 @@ func (difftool *xdcrDiffTool) retrieveReplicationSpecInfo() error {
 	}
 
 	difftool.logger.Infof("Found Remote Cluster: %v and Replication Spec: %v\n", difftool.specifiedRef.String(), difftool.specifiedSpec.String())
-	return nil
+
+	return difftool.populateSelfRef()
 }
 
 func (difftool *xdcrDiffTool) populateTemporarySpecAndRef() error {
@@ -1331,8 +881,7 @@ func (difftool *xdcrDiffTool) populateSelfRef() error {
 
 	// Only grab certificate if on a loopback device
 	if difftool.specifiedRef.IsHttps() && isURLLoopBack(options.sourceUrl) {
-		cert, err := utils.GetCertificate(difftool.utils, options.sourceUrl, options.sourceUsername,
-			options.sourcePassword, xdcrBase.HttpAuthMechPlain)
+		cert, err := utils.GetCertificate(difftool.utils, options.sourceUrl, options.sourceUsername, options.sourcePassword, xdcrBase.HttpAuthMechPlain)
 		if err != nil {
 			return err
 		}
@@ -1343,15 +892,11 @@ func (difftool *xdcrDiffTool) populateSelfRef() error {
 		}
 
 		difftool.selfRef.Certificate_ = cert
-		refHttpAuthMech, defaultPoolInfo, _, err := difftool.utils.GetSecuritySettingsAndDefaultPoolInfo(options.sourceUrl,
-			internalHttpsHostname, difftool.selfRef.UserName(), difftool.selfRef.Password(),
-			difftool.selfRef.Certificates(), difftool.selfRef.ClientCertificate(), difftool.selfRef.ClientKey(),
-			difftool.selfRef.IsHalfEncryption(), difftool.logger)
+		refHttpAuthMech, _, _, err := difftool.utils.GetSecuritySettingsAndDefaultPoolInfo(options.sourceUrl, internalHttpsHostname, difftool.selfRef.UserName(), difftool.selfRef.Password(), difftool.selfRef.Certificate(), difftool.selfRef.ClientCertificate(), difftool.selfRef.ClientKey(), difftool.selfRef.IsHalfEncryption(), difftool.logger)
 		if err != nil {
 			return fmt.Errorf("unable to get security settings: %v", err)
 		}
 		difftool.selfRef.SetHttpAuthMech(refHttpAuthMech)
-		difftool.selfDefaultPoolInfo = defaultPoolInfo
 
 		if refHttpAuthMech == xdcrBase.HttpAuthMechHttps {
 			// Need to get the secure port and attach it
@@ -1365,35 +910,12 @@ func (difftool *xdcrDiffTool) populateSelfRef() error {
 		}
 	}
 
-	poolsNodesPath := "/pools/nodes"
-	err, _ := difftool.utils.QueryRestApi(options.sourceUrl, poolsNodesPath, false, xdcrBase.MethodGet, "", nil, 0, &difftool.selfPoolsNodes, nil)
-	if err != nil {
-		return fmt.Errorf("unable to get pools/nodes information: %v", err)
-	}
-
 	// Do this last
 	atomic.StoreUint32(&difftool.selfRefPopulated, 1)
 	return nil
 }
 
-func (difftool *xdcrDiffTool) retrieveClustersCapabilities(legacyMode bool, xdcrCompTopologyMockCb func()) error {
-	var err error
-	difftool.specifiedRef, err = difftool.remoteClusterSvc.RemoteClusterByRefName(options.remoteClusterName, true /*refresh*/)
-	if err != nil {
-		for err != nil && err == metadata_svc.RefreshNotEnabledYet {
-			difftool.logger.Infof("Difftool hasn't finished reaching out to remote cluster. Sleeping 5 seconds and retrying...")
-			time.Sleep(5 * time.Second)
-			difftool.specifiedRef, err = difftool.remoteClusterSvc.RemoteClusterByRefName(options.remoteClusterName, true /*refresh*/)
-		}
-		if err != nil {
-			difftool.logger.Errorf("Error retrieving remote clusters: %v\n", err)
-			return err
-		}
-	}
-	if err = difftool.populateSelfRef(); err != nil {
-		return err
-	}
-
+func (difftool *xdcrDiffTool) retrieveClustersCapabilities(legacyMode bool) error {
 	if !legacyMode {
 		ref, err := difftool.remoteClusterSvc.RemoteClusterByRefName(difftool.specifiedRef.Name(), false)
 		if err != nil {
@@ -1415,7 +937,7 @@ func (difftool *xdcrDiffTool) retrieveClustersCapabilities(legacyMode bool, xdcr
 		return fmt.Errorf("retrieveClusterCapabilities.myConnStr(%v) - %v", difftool.selfRef.Name(), err)
 	}
 	defaultPoolInfo, err := difftool.utils.GetClusterInfo(connStr, xdcrBase.DefaultPoolPath, difftool.selfRef.UserName(),
-		difftool.selfRef.Password(), difftool.selfRef.HttpAuthMech(), difftool.selfRef.Certificates(),
+		difftool.selfRef.Password(), difftool.selfRef.HttpAuthMech(), difftool.selfRef.Certificate(),
 		difftool.selfRef.SANInCertificate(), difftool.selfRef.ClientCertificate(), difftool.selfRef.ClientKey(),
 		difftool.logger)
 	if err != nil {
@@ -1425,14 +947,16 @@ func (difftool *xdcrDiffTool) retrieveClustersCapabilities(legacyMode bool, xdcr
 	err = difftool.srcCapabilities.LoadFromDefaultPoolInfo(defaultPoolInfo, difftool.logger)
 	if err != nil {
 		return fmt.Errorf("retrieveClusterCapabilities.LoadFromDefaultPoolInfo(%v) - %v", defaultPoolInfo, err)
-	} else {
-		// At this point, clusterCompat is parsable and just cache it for later mocks
-		nodeList, _ := xdcrBase.GetNodeListFromInfoMap(defaultPoolInfo, difftool.logger)
-		difftool.srcClusterCompat, _ = xdcrBase.GetClusterCompatibilityFromNodeList(nodeList)
 	}
 
-	if xdcrCompTopologyMockCb != nil {
-		xdcrCompTopologyMockCb()
+	difftool.logger.Infof("Source cluster supports collections: %v Target cluster supports collections: %v\n",
+		difftool.srcCapabilities.HasCollectionSupport(), difftool.tgtCapabilities.HasCollectionSupport())
+
+	if difftool.srcCapabilities.HasCollectionSupport() || difftool.tgtCapabilities.HasCollectionSupport() {
+		err = difftool.populateCollectionsPreReq()
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1604,7 +1128,7 @@ func (difftool *xdcrDiffTool) populateDedupColIds(tgtColIds []uint32, tgtColIdDe
 		_, exists := tgtColIdDedupMap[tgtColId]
 		if !exists {
 			tgtColIdDedupMap[tgtColId] = true
-			difftool.tgtCollectionIds = append(difftool.tgtCollectionIds, tgtColId)
+			difftool.tgtCollectionIds = append(difftool.tgtCollectionIds)
 		}
 	}
 }
@@ -1630,7 +1154,7 @@ func (difftool *xdcrDiffTool) compileMigrationMapping(nsMappings metadata.Collec
 		difftool.colFilterOrderedKeys = append(difftool.colFilterOrderedKeys, srcNs.String())
 	}
 
-	difftool.logger.Infof("Collections Migrations filters ordered list:\n")
+	difftool.logger.Infof("Collections Migrations filters:\n")
 	for i, filterStr := range difftool.colFilterOrderedKeys {
 		difftool.logger.Infof("%v : %v -> %v", i, filterStr, difftool.colFilterOrderedTargetNs[i].ToIndexString())
 	}
@@ -1643,24 +1167,6 @@ func (difftool *xdcrDiffTool) compileMigrationMapping(nsMappings metadata.Collec
 		}
 		difftool.srcToTgtColIdsMap[0] = append(difftool.srcToTgtColIdsMap[0], targetColId)
 		difftool.colFilterOrderedTargetColId = append(difftool.colFilterOrderedTargetColId, targetColId)
-	}
-
-	// The migrationMapping will be shared among many components, so we need to make sure it is sharable
-	return difftool.populateMigrationMapping(nsMappings)
-}
-
-func (difftool *xdcrDiffTool) populateMigrationMapping(namespaceMappings metadata.CollectionNamespaceMapping) error {
-	difftool.migrationMapping = namespaceMappings.Clone()
-	filterMode := difftool.specifiedSpec.Settings.GetExpDelMode()
-	mobileCompat := difftool.specifiedSpec.Settings.GetMobileCompatible()
-	for srcNamespacePtr, _ := range difftool.migrationMapping {
-		// For each sourceNamespace, its filter needs to be a pool
-		expr := srcNamespacePtr.GetFilterString()
-		pool, err := filterPool.NewFilterPool(options.numOfFiltersInFilterPool, expr, difftool.utils, filterMode, mobileCompat)
-		if err != nil {
-			return err
-		}
-		srcNamespacePtr.ReplaceFilter(pool)
 	}
 	return nil
 }

@@ -9,26 +9,6 @@
 
 package base
 
-// const (
-// 	GET                   = mc.CommandCode(0x00)
-// 	GET_WITH_META         = mc.CommandCode(0xa0)
-// 	SET_WITH_META         = mc.CommandCode(0xa2)
-// 	ADD_WITH_META         = mc.CommandCode(0xa4)
-// 	DELETE_WITH_META      = mc.CommandCode(0xa8)
-// 	SET_TIME_SYNC         = mc.CommandCode(0xc1)
-// 	SUBDOC_DICT_UPSERT    = mc.CommandCode(0xc8)
-// 	SUBDOC_DELETE         = mc.CommandCode(0xc9)
-// 	SUBDOC_MULTI_MUTATION = mc.CommandCode(0xd1)
-// )
-
-// Flags for SUBDOC commands
-const (
-	// Path level flag
-	SUBDOC_FLAG_MKDIR_P       = 0x01
-	SUBDOC_FLAG_XATTR         = 0x04
-	SUBDOC_FLAG_EXPAND_MACROS = 0x10
-)
-
 const NumberOfVbuckets = 1024
 const DcpHandlerChanSize = 100000
 const FileNamePrefix = "diffTool"
@@ -50,7 +30,6 @@ const DiffDetailsFileName = "diffDetails"
 const DiffKeysSrcMigrationHintSuffix = "hint"
 const MutationDiffFileName = "mutationDiffDetails"
 const MutationDiffColIdMapping = "mutationDiffColIdMapping"
-const MutationDiffMigrationDetails = "mutationMigrationDetails"
 const DiffErrorKeysFileName = "diffKeysWithError"
 const StatsReportInterval = 5
 const SourceClusterName = "source"
@@ -64,7 +43,7 @@ const SASLPasswordKey = "saslPassword"
 const HttpGet = "GET"
 
 // default values for configurable parameters if not specified by user
-const BucketOpTimeout uint64 = 20
+const BucketOpTimeout uint64 = 120
 const GetStatsRetryInterval uint64 = 2
 const GetStatsMaxBackoff uint64 = 10
 const SendBatchRetryInterval uint64 = 500
@@ -123,13 +102,3 @@ const CouchbaseSecurePrefix = "couchbases://"
 var SetupTimeoutSeconds int = 10
 
 const JSONDataType = 1
-
-const (
-	MutationCompareTypeMetadata    = "meta" // This is the default
-	MutationCompareTypeBodyAndMeta = "both" // This is the original method
-	MutationCompareTypeBodyOnly    = "body"
-)
-
-var MutationDiffCompareType = []string{MutationCompareTypeMetadata, MutationCompareTypeBodyOnly, MutationCompareTypeBodyAndMeta}
-
-const Uint32MaxVal uint32 = 1<<32 - 1

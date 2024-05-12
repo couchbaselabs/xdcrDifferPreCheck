@@ -13,7 +13,7 @@ import (
 	"xdcrDiffer/utils"
 
 	"github.com/couchbase/gocb/v2"
-	"github.com/couchbase/gocbcore/v10"
+	"github.com/couchbase/gocbcore/v9"
 	xdcrBase "github.com/couchbase/goxdcr/base"
 	xdcrLog "github.com/couchbase/goxdcr/log"
 	"github.com/rcrowley/go-metrics"
@@ -349,7 +349,6 @@ func (cm *CheckpointManager) getStatsWithRetry() (map[string]map[string]string, 
 		callback := func(result *gocbcore.StatsResult, cbErr error) {
 			defer waitGroup.Done()
 			if cbErr != nil {
-				cm.logger.Debugf("StatsMap received callback err: %v\n", cbErr)
 				err = cbErr
 			} else {
 				errMap := make(xdcrBase.ErrorMap)
@@ -377,26 +376,20 @@ func (cm *CheckpointManager) getStatsWithRetry() (map[string]map[string]string, 
 				err = utils.ParseHighSeqnoStat(statsMap, endSeqnoMap, vbuuidMap, true)
 				if err != nil {
 					for server, singleServerStats := range result.Servers {
-						cm.logger.Warnf("server %v received stats %v", server, singleServerStats.Stats)
+						cm.logger.Infof("Server %v received stats %v", server, singleServerStats.Stats)
 					}
 				}
 			}
 		}
 
 		waitGroup.Add(1)
-		_, enqErr := cm.agent.Stats(gocbcore.StatsOptions{
+		cm.agent.Stats(gocbcore.StatsOptions{
 			Key:           base.VbucketSeqnoStatName,
 			Deadline:      time.Now().Add(cm.bucketOpTimeout),
 			RetryStrategy: &base.RetryStrategy{},
 		}, callback)
-		waitGroup.Wait()
 
-		if enqErr != nil {
-			cm.logger.Errorf("cm.agent.Stats err %v", enqErr)
-			if err == nil {
-				err = enqErr
-			}
-		}
+		waitGroup.Wait()
 		return err
 	}
 
@@ -405,7 +398,7 @@ func (cm *CheckpointManager) getStatsWithRetry() (map[string]map[string]string, 
 	if opErr != nil {
 		return nil, opErr
 	} else {
-		return statsMap, err
+		return statsMap, nil
 	}
 }
 
@@ -623,16 +616,13 @@ func (cm *CheckpointManager) initializeBucket() (err error) {
 	useTLS, x509Provider, authProvider, err := getAgentConfigs(auth)
 
 	agentConfig := &gocbcore.AgentConfig{
-		SeedConfig: gocbcore.SeedConfig{MemdAddrs: []string{bucketConnStr}},
-		BucketName: cm.dcpDriver.bucketName,
-		UserAgent:  fmt.Sprintf("xdcrDifferCheckpointMgr"),
-		SecurityConfig: gocbcore.SecurityConfig{
-			UseTLS:            useTLS,
-			TLSRootCAProvider: x509Provider,
-			Auth:              authProvider,
-			AuthMechanisms:    base.ScramShaAuth,
-		},
-		IoConfig: gocbcore.IoConfig{UseCollections: cm.dcpDriver.capabilities.HasCollectionSupport()},
+		MemdAddrs:         []string{bucketConnStr},
+		BucketName:        cm.dcpDriver.bucketName,
+		UserAgent:         fmt.Sprintf("xdcrDifferCheckpointMgr"),
+		UseTLS:            useTLS,
+		Auth:              authProvider,
+		TLSRootCAProvider: x509Provider,
+		UseCollections:    cm.dcpDriver.capabilities.HasCollectionSupport(),
 	}
 
 	agent, err := gocbcore.CreateAgent(agentConfig)

@@ -13,77 +13,67 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
+	gocbcore "github.com/couchbase/gocbcore/v9"
+	"github.com/couchbase/gomemcached"
+	mcc "github.com/couchbase/gomemcached/client"
+	xdcrParts "github.com/couchbase/goxdcr/base/filter"
+	xdcrLog "github.com/couchbase/goxdcr/log"
+	xdcrUtils "github.com/couchbase/goxdcr/utils"
 	"os"
 	"strings"
 	"sync"
-
 	"xdcrDiffer/base"
 	fdp "xdcrDiffer/fileDescriptorPool"
 	"xdcrDiffer/utils"
-
-	"github.com/couchbase/gocbcore/v10"
-	"github.com/couchbase/gomemcached"
-	mcc "github.com/couchbase/gomemcached/client"
-	xdcrBase "github.com/couchbase/goxdcr/base"
-	xdcrParts "github.com/couchbase/goxdcr/base/filter"
-	xdcrLog "github.com/couchbase/goxdcr/log"
-	"github.com/couchbase/goxdcr/metadata"
-	xdcrUtils "github.com/couchbase/goxdcr/utils"
 )
 
 // implements StreamObserver
 type DcpHandler struct {
-	dcpClient                     *DcpClient
-	fileDir                       string
-	index                         int
-	vbList                        []uint16
-	numberOfBins                  int
-	dataChan                      chan *Mutation
-	waitGrp                       sync.WaitGroup
-	finChan                       chan bool
-	bucketMap                     map[uint16]map[int]*Bucket
-	fdPool                        fdp.FdPoolIface
-	logger                        *xdcrLog.CommonLogger
-	filter                        xdcrParts.Filter
-	incrementCounter              func()
-	incrementSysOrUnsubbedCounter func()
-	colMigrationFilters           []string
-	colMigrationFiltersOn         bool // shortcut to avoid len() check
-	colMigrationFiltersImpl       []xdcrParts.Filter
-	isSource                      bool
-	utils                         xdcrUtils.UtilsIface
-	bufferCap                     int
-	migrationMapping              metadata.CollectionNamespaceMapping
-	mobileCompatible              int
-	expDelMode                    xdcrBase.FilterExpDelType
+	dcpClient               *DcpClient
+	fileDir                 string
+	index                   int
+	vbList                  []uint16
+	numberOfBins            int
+	dataChan                chan *Mutation
+	waitGrp                 sync.WaitGroup
+	finChan                 chan bool
+	bucketMap               map[uint16]map[int]*Bucket
+	fdPool                  fdp.FdPoolIface
+	logger                  *xdcrLog.CommonLogger
+	filter                  xdcrParts.Filter
+	incrementCounter        func()
+	incrementSysCounter     func()
+	colMigrationFilters     []string
+	colMigrationFiltersOn   bool // shortcut to avoid len() check
+	colMigrationFiltersImpl []xdcrParts.Filter
+	isSource                bool
+	utils                   xdcrUtils.UtilsIface
+	bufferCap               int
 }
 
-func NewDcpHandler(dcpClient *DcpClient, fileDir string, index int, vbList []uint16, numberOfBins, dataChanSize int, fdPool fdp.FdPoolIface, incReceivedCounter, incSysOrUnsubbedEvtReceived func(), colMigrationFilters []string, utils xdcrUtils.UtilsIface, bufferCap int, migrationMapping metadata.CollectionNamespaceMapping) (*DcpHandler, error) {
+func NewDcpHandler(dcpClient *DcpClient, fileDir string, index int, vbList []uint16, numberOfBins, dataChanSize int, fdPool fdp.FdPoolIface, incReceivedCounter, incSysEvtReceived func(), colMigrationFilters []string, utils xdcrUtils.UtilsIface, bufferCap int) (*DcpHandler, error) {
 	if len(vbList) == 0 {
 		return nil, fmt.Errorf("vbList is empty for handler %v", index)
 	}
 	return &DcpHandler{
-		dcpClient:                     dcpClient,
-		fileDir:                       fileDir,
-		index:                         index,
-		vbList:                        vbList,
-		numberOfBins:                  numberOfBins,
-		dataChan:                      make(chan *Mutation, dataChanSize),
-		finChan:                       make(chan bool),
-		bucketMap:                     make(map[uint16]map[int]*Bucket),
-		fdPool:                        fdPool,
-		logger:                        dcpClient.logger,
-		filter:                        dcpClient.dcpDriver.filter,
-		incrementCounter:              incReceivedCounter,
-		incrementSysOrUnsubbedCounter: incSysOrUnsubbedEvtReceived,
-		colMigrationFilters:           colMigrationFilters,
-		colMigrationFiltersOn:         len(colMigrationFilters) > 0,
-		utils:                         utils,
-		isSource:                      strings.Contains(dcpClient.Name, base.SourceClusterName),
-		bufferCap:                     bufferCap,
-		migrationMapping:              migrationMapping,
-		mobileCompatible:              dcpClient.dcpDriver.mobileCompatible,
-		expDelMode:                    dcpClient.dcpDriver.expDelMode,
+		dcpClient:             dcpClient,
+		fileDir:               fileDir,
+		index:                 index,
+		vbList:                vbList,
+		numberOfBins:          numberOfBins,
+		dataChan:              make(chan *Mutation, dataChanSize),
+		finChan:               make(chan bool),
+		bucketMap:             make(map[uint16]map[int]*Bucket),
+		fdPool:                fdPool,
+		logger:                dcpClient.logger,
+		filter:                dcpClient.dcpDriver.filter,
+		incrementCounter:      incReceivedCounter,
+		incrementSysCounter:   incSysEvtReceived,
+		colMigrationFilters:   colMigrationFilters,
+		colMigrationFiltersOn: len(colMigrationFilters) > 0,
+		utils:                 utils,
+		isSource:              strings.Contains(dcpClient.Name, base.SourceClusterName),
+		bufferCap:             bufferCap,
 	}, nil
 }
 
@@ -113,7 +103,7 @@ func (d *DcpHandler) compileMigrCollectionFiltersIfNeeded() error {
 	}
 
 	for i, filterStr := range d.colMigrationFilters {
-		filter, err := xdcrParts.NewFilter(fmt.Sprintf("%d", i), filterStr, d.utils, d.expDelMode, d.mobileCompatible)
+		filter, err := xdcrParts.NewFilter(fmt.Sprintf("%d", i), filterStr, d.utils)
 		if err != nil {
 			return fmt.Errorf("compiling %v resulted in: %v", filterStr, err)
 		}
@@ -189,18 +179,14 @@ func (dh *DcpHandler) processMutation(mut *Mutation) {
 
 	dh.incrementCounter()
 
-	// Ignore system events
-	// Ignore unsubscribed events - mutations/events from collections not subscribed during OpenStream
-	// we only care about actual data
-	if mut.IsSystemOrUnsubbedEvent() {
-		dh.incrementSysOrUnsubbedCounter()
+	// Ignore system events - we only care about actual data
+	if mut.IsSystemEvent() {
+		dh.incrementSysCounter()
 		return
 	}
 
 	var filterIdsMatched []uint8
 	if dh.colMigrationFiltersOn && dh.isSource {
-		dh.checkColMigrationDataCloned(mut)
-
 		filterIdsMatched = dh.checkColMigrationFilters(mut)
 		if len(filterIdsMatched) == 0 {
 			return
@@ -228,7 +214,7 @@ func (dh *DcpHandler) replicationFilter(mut *Mutation, matched bool, filterResul
 	var err error
 	var errStr string
 	if dh.filter != nil && mut.IsMutation() {
-		matched, err, errStr, _, _ = dh.filter.FilterUprEvent(mut.ToUprEvent())
+		matched, err, errStr, _ = dh.filter.FilterUprEvent(mut.ToUprEvent())
 		if !matched {
 			filterResult = base.Filtered
 		}
@@ -248,95 +234,71 @@ func (dh *DcpHandler) writeToDataChan(mut *Mutation) {
 	}
 }
 
-func (dh *DcpHandler) SnapshotMarker(snapshot gocbcore.DcpSnapshotMarker) {
-	dh.dcpClient.dcpDriver.checkpointManager.updateSnapshot(snapshot.VbID, snapshot.StartSeqNo, snapshot.EndSeqNo)
+func (dh *DcpHandler) SnapshotMarker(startSeqno, endSeqno uint64, vbno uint16, streamID uint16, snapshotType gocbcore.SnapshotState) {
+	dh.dcpClient.dcpDriver.checkpointManager.updateSnapshot(vbno, startSeqno, endSeqno)
 }
 
-func (dh *DcpHandler) Mutation(mutation gocbcore.DcpMutation) {
-	dh.writeToDataChan(CreateMutation(mutation.VbID, mutation.Key, mutation.SeqNo, mutation.RevNo, mutation.Cas, mutation.Flags, mutation.Expiry, gomemcached.UPR_MUTATION, mutation.Value, mutation.Datatype, mutation.CollectionID))
+func (dh *DcpHandler) Mutation(seqno, revId uint64, flags, expiry, lockTime uint32, cas uint64, datatype uint8, vbno uint16, collectionID uint32, streamID uint16, key, value []byte) {
+	dh.writeToDataChan(CreateMutation(vbno, key, seqno, revId, cas, flags, expiry, gomemcached.UPR_MUTATION, value, datatype, collectionID))
 }
 
-func (dh *DcpHandler) Deletion(deletion gocbcore.DcpDeletion) {
-	dh.writeToDataChan(CreateMutation(deletion.VbID, deletion.Key, deletion.SeqNo, deletion.RevNo, deletion.Cas, 0, 0, gomemcached.UPR_DELETION, deletion.Value, deletion.Datatype, deletion.CollectionID))
+func (dh *DcpHandler) Deletion(seqno, revId uint64, deleteTime uint32, cas uint64, datatype uint8, vbno uint16, collectionID uint32, streamID uint16, key, value []byte) {
+	dh.writeToDataChan(CreateMutation(vbno, key, seqno, revId, cas, 0, 0, gomemcached.UPR_DELETION, value, datatype, collectionID))
 }
 
-func (dh *DcpHandler) Expiration(expiration gocbcore.DcpExpiration) {
-	dh.writeToDataChan(CreateMutation(expiration.VbID, expiration.Key, expiration.SeqNo, expiration.RevNo, expiration.Cas, 0, 0, gomemcached.UPR_EXPIRATION, nil, 0, expiration.CollectionID))
+func (dh *DcpHandler) Expiration(seqno, revId uint64, deleteTime uint32, cas uint64, vbno uint16, collectionID uint32, streamID uint16, key []byte) {
+	dh.writeToDataChan(CreateMutation(vbno, key, seqno, revId, cas, 0, 0, gomemcached.UPR_EXPIRATION, nil, 0, collectionID))
 }
 
-func (dh *DcpHandler) End(streamEnd gocbcore.DcpStreamEnd, err error) {
-	dh.dcpClient.dcpDriver.handleVbucketCompletion(streamEnd.VbID, err, "dcp stream ended")
+func (dh *DcpHandler) End(vbno uint16, streamID uint16, err error) {
+	dh.dcpClient.dcpDriver.handleVbucketCompletion(vbno, err, "dcp stream ended")
 }
 
-// want CreateCollection("github.com/couchbase/gocbcore/v10".DcpCollectionCreation)
-func (dh *DcpHandler) CreateCollection(creation gocbcore.DcpCollectionCreation) {
-	dh.writeToDataChan(CreateMutation(creation.VbID, creation.Key, creation.SeqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, creation.CollectionID))
+func (dh *DcpHandler) CreateCollection(seqNo uint64, version uint8, vbID uint16, manifestUID uint64, scopeID uint32, collectionID uint32, ttl uint32, streamID uint16, key []byte) {
+	dh.writeToDataChan(CreateMutation(vbID, key, seqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, collectionID))
 }
 
-func (dh *DcpHandler) DeleteCollection(deletion gocbcore.DcpCollectionDeletion) {
-	dh.writeToDataChan(CreateMutation(deletion.VbID, nil, deletion.SeqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, deletion.CollectionID))
+func (dh *DcpHandler) DeleteCollection(seqNo uint64, version uint8, vbID uint16, manifestUID uint64, scopeID uint32, collectionID uint32, streamID uint16) {
+	dh.writeToDataChan(CreateMutation(vbID, nil, seqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, collectionID))
 }
 
-func (dh *DcpHandler) FlushCollection(flush gocbcore.DcpCollectionFlush) {
+func (dh *DcpHandler) FlushCollection(seqNo uint64, version uint8, vbID uint16, manifestUID uint64, collectionID uint32) {
 	// Don't care - not implemented anyway
 }
 
-func (dh *DcpHandler) CreateScope(creation gocbcore.DcpScopeCreation) {
+func (dh *DcpHandler) CreateScope(seqNo uint64, version uint8, vbID uint16, manifestUID uint64, scopeID uint32, streamID uint16, key []byte) {
 	// Overloading collectionID field for scopeID because differ doesn't care
-	dh.writeToDataChan(CreateMutation(creation.VbID, nil, creation.SeqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, creation.ScopeID))
+	dh.writeToDataChan(CreateMutation(vbID, nil, seqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, scopeID))
 }
 
-func (dh *DcpHandler) DeleteScope(deletion gocbcore.DcpScopeDeletion) {
+func (dh *DcpHandler) DeleteScope(seqNo uint64, version uint8, vbID uint16, manifestUID uint64, scopeID uint32, streamID uint16) {
 	// Overloading collectionID field for scopeID because differ doesn't care
-	dh.writeToDataChan(CreateMutation(deletion.VbID, nil, deletion.SeqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, deletion.ScopeID))
+	dh.writeToDataChan(CreateMutation(vbID, nil, seqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, scopeID))
 }
 
-func (dh *DcpHandler) ModifyCollection(modify gocbcore.DcpCollectionModification) {
+func (dh *DcpHandler) ModifyCollection(seqNo uint64, version uint8, vbID uint16, manifestUID uint64, collectionID uint32, ttl uint32, streamID uint16) {
 	// Overloading collectionID field for scopeID because differ doesn't care
-	dh.writeToDataChan(CreateMutation(modify.VbID, nil, modify.SeqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, modify.CollectionID))
+	dh.writeToDataChan(CreateMutation(vbID, nil, seqNo, 0, 0, 0, 0, gomemcached.DCP_SYSTEM_EVENT, nil, 0, collectionID))
 }
 
-func (dh *DcpHandler) OSOSnapshot(oso gocbcore.DcpOSOSnapshot) {
+func (dh *DcpHandler) OSOSnapshot(vbID uint16, snapshotType uint32, streamID uint16) {
 	// Don't care
 }
 
-func (dh *DcpHandler) SeqNoAdvanced(seqnoAdv gocbcore.DcpSeqNoAdvanced) {
-	// This is needed because the seqnos of mutations/events of collections to which the consumer is not subscribed during OpenStream() has to be recorded
-	// Eventhough such mutations/events are not streamed by the producer
-	// bySeqno stores the value of the current high seqno of the vbucket
-	// collectionId parameter of CreateMutation() is insignificant
-	dh.writeToDataChan(CreateMutation(seqnoAdv.VbID, nil, seqnoAdv.SeqNo, 0, 0, 0, 0, gomemcached.DCP_SEQNO_ADV, nil, 0, base.Uint32MaxVal))
+func (dh *DcpHandler) SeqNoAdvanced(vbID uint16, bySeqno uint64, streamID uint16) {
+	// Don't care
 }
 
 func (dh *DcpHandler) checkColMigrationFilters(mut *Mutation) []uint8 {
-	// We don't diff deletion/expiration for migration. Otherwise it is confusing.
-	if mut.OpCode == gomemcached.UPR_EXPIRATION || mut.OpCode == gomemcached.UPR_DELETION {
-		return []uint8{}
-	}
 	var filterIdsMatched []uint8
 	for i, filter := range dh.colMigrationFiltersImpl {
 		// If at least one passed, let it through
-		matched, _, _, _, _ := filter.FilterUprEvent(mut.ToUprEvent())
+		matched, _, _, _ := filter.FilterUprEvent(mut.ToUprEvent())
 		if matched {
 			filterIdsMatched = append(filterIdsMatched, uint8(i))
 		}
 	}
 	return filterIdsMatched
-}
-
-func (dh *DcpHandler) checkColMigrationDataCloned(mut *Mutation) {
-	if dh.logger.GetLogLevel() != xdcrLog.LogLevelDebug {
-		return
-	}
-
-	uprEvent := mut.ToUprEvent()
-	dummyReq := &xdcrBase.WrappedMCRequest{}
-	dummyReq.Req = &gomemcached.MCRequest{}
-	matchedNamespaces, errMap, errMCReqMap := dh.migrationMapping.GetTargetUsingMigrationFilter(uprEvent, dummyReq, dh.logger)
-	if len(matchedNamespaces) > 1 {
-		dh.logger.Debugf("Document %s (%x) with length %v opCode %v matched more than once: %v, errMap %v, errMCReqMap %v",
-			uprEvent.UprEvent.Key, uprEvent.UprEvent.Key, len(uprEvent.UprEvent.Key), uprEvent.UprEvent.Opcode, matchedNamespaces.String(), errMap, errMCReqMap)
-	}
 }
 
 type Bucket struct {
@@ -480,12 +442,12 @@ func (m *Mutation) IsMutation() bool {
 	return m.OpCode == gomemcached.UPR_MUTATION
 }
 
-func (m *Mutation) IsSystemOrUnsubbedEvent() bool {
-	return m.OpCode == gomemcached.DCP_SYSTEM_EVENT || m.OpCode == gomemcached.DCP_SEQNO_ADV
+func (m *Mutation) IsSystemEvent() bool {
+	return m.OpCode == gomemcached.DCP_SYSTEM_EVENT
 }
 
-func (m *Mutation) ToUprEvent() *xdcrBase.WrappedUprEvent {
-	uprEvent := &mcc.UprEvent{
+func (m *Mutation) ToUprEvent() *mcc.UprEvent {
+	return &mcc.UprEvent{
 		Opcode:       m.OpCode,
 		VBucket:      m.Vbno,
 		DataType:     m.Datatype,
@@ -497,33 +459,23 @@ func (m *Mutation) ToUprEvent() *xdcrBase.WrappedUprEvent {
 		Seqno:        m.Seqno,
 		CollectionId: m.ColId,
 	}
-
-	return &xdcrBase.WrappedUprEvent{
-		UprEvent:     uprEvent,
-		ColNamespace: nil,
-		Flags:        0,
-		ByteSliceGetter: func(size uint64) ([]byte, error) {
-			return make([]byte, int(size)), nil
-		},
-	}
 }
 
 // serialize mutation into []byte
 // format:
-//
-//	keyLen   - 2 bytes
-//	Key  - length specified by keyLen
-//	Seqno    - 8 bytes
-//	RevId    - 8 bytes
-//	Cas      - 8 bytes
-//	Flags    - 4 bytes
-//	Expiry   - 4 bytes
-//	opType   - 2 byte
-//	Datatype - 2 byte
-//	hash     - 64 bytes
-//	collectionId - 4 bytes
-//	colFiltersLen - 2 byte (number of collection migration filters)
-//	(per col filter) - 2 byte
+//  keyLen   - 2 bytes
+//  Key  - length specified by keyLen
+//  Seqno    - 8 bytes
+//  RevId    - 8 bytes
+//  Cas      - 8 bytes
+//  Flags    - 4 bytes
+//  Expiry   - 4 bytes
+//  opType   - 2 byte
+//  Datatype - 2 byte
+//  hash     - 64 bytes
+//  collectionId - 4 bytes
+//  colFiltersLen - 1 byte (number of collection migration filters)
+//  (per col filter) - 1 byte
 func (mut *Mutation) Serialize() []byte {
 	keyLen := len(mut.Key)
 	ret := make([]byte, base.GetFixedSizeMutationLen(keyLen, mut.ColFiltersMatched))

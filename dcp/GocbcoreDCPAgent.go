@@ -6,8 +6,8 @@ import (
 	"time"
 	"xdcrDiffer/base"
 
-	gocbcore "github.com/couchbase/gocbcore/v10"
-	memd "github.com/couchbase/gocbcore/v10/memd"
+	gocbcore "github.com/couchbase/gocbcore/v9"
+	memd "github.com/couchbase/gocbcore/v9/memd"
 	xdcrBase "github.com/couchbase/goxdcr/base"
 )
 
@@ -69,22 +69,15 @@ func (f *GocbcoreDCPFeed) setupDCPAgentConfig(authMech interface{}, collections 
 	if err != nil {
 		return nil, false, err
 	}
-
 	return &gocbcore.DCPAgentConfig{
-		UserAgent:  f.Name,
-		BucketName: f.BucketName,
-		SecurityConfig: gocbcore.SecurityConfig{
-			UseTLS:            useTLS,
-			TLSRootCAProvider: x509Provider,
-			Auth:              auth,
-			AuthMechanisms:    base.ScramShaAuth,
-		},
-		KVConfig: gocbcore.KVConfig{
-			ConnectTimeout: f.SetupTimeout,
-		},
-		CompressionConfig: gocbcore.CompressionConfig{Enabled: true},
-		IoConfig:          gocbcore.IoConfig{UseCollections: collections},
-		HTTPConfig:        gocbcore.HTTPConfig{ConnectTimeout: f.SetupTimeout},
+		UserAgent:         f.Name,
+		BucketName:        f.BucketName,
+		Auth:              auth,
+		ConnectTimeout:    f.SetupTimeout,
+		KVConnectTimeout:  f.SetupTimeout,
+		UseCollections:    collections,
+		UseTLS:            useTLS,
+		TLSRootCAProvider: x509Provider,
 	}, useTLS, nil
 }
 
