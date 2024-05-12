@@ -871,6 +871,8 @@ func NewDiffTool(legacyMode bool) (*xdcrDiffTool, error) {
 		colFilterToTgtColIdsMap: map[string][]uint32{},
 	}
 
+	xdcrBase.BucketInfoOpMaxRetry = 10
+
 	difftool.logger = xdcrLog.NewLogger("xdcrDiffTool", nil)
 
 	difftool.selfRef, _ = metadata.NewRemoteClusterReference("", base.SelfReferenceName, options.sourceUrl, options.sourceUsername, options.sourcePassword,
@@ -1479,6 +1481,8 @@ func (difftool *xdcrDiffTool) populateSelfRef() error {
 				sslHostString := xdcrBase.GetHostAddr(xdcrBase.GetHostName(options.sourceUrl), internalSSLPort)
 				difftool.selfRef.SetHttpsHostName(sslHostString)
 				difftool.selfRef.SetActiveHttpsHostName(sslHostString)
+				difftool.selfRef.SetHostName(sslHostString)
+				difftool.selfRef.DemandEncryption_ = difftool.specifiedRef.DemandEncryption_
 				difftool.logger.Infof("Received SSL port to be %v and setting TLS hostname to %v", internalSSLPort, sslHostString)
 			}
 		}
