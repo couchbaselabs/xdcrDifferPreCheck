@@ -11,10 +11,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -26,8 +29,11 @@ import (
 	fdp "xdcrDiffer/fileDescriptorPool"
 	"xdcrDiffer/utils"
 
+	"github.com/couchbase/gocb/v2"
+	mcc "github.com/couchbase/gomemcached/client"
 	xdcrBase "github.com/couchbase/goxdcr/base"
 	xdcrParts "github.com/couchbase/goxdcr/base/filter"
+	"github.com/couchbase/goxdcr/log"
 	xdcrLog "github.com/couchbase/goxdcr/log"
 	"github.com/couchbase/goxdcr/metadata"
 	"github.com/couchbase/goxdcr/metadata_svc"
@@ -127,6 +133,8 @@ var options struct {
 	debugMode bool
 	// a common setup timeout duration - in seconds
 	setupTimeout int
+
+	preCheckMode int
 }
 
 func argParse() {
@@ -232,6 +240,8 @@ func argParse() {
 		"The differ to be run with debug log level and the SDK/gocb logging will also be enabled.")
 	flag.IntVar(&options.setupTimeout, "setupTimeout", base.SetupTimeoutSeconds,
 		"Common setup timeout duration in seconds")
+	flag.IntVar(&options.preCheckMode, "preCheckMode", base.PreCheckMode,
+		"PreCheck mode - 0 (default): normal differ run, 1: ns_server checks, 2: memcached checks")
 
 	flag.Parse()
 }
@@ -297,6 +307,558 @@ type xdcrDiffTool struct {
 	curState difftoolState
 
 	legacyMode bool
+}
+
+type mccClientIfcWithErr struct {
+	clientIfc mcc.ClientIface
+	err       error
+}
+
+func connectToRemoteNS(ref *metadata.RemoteClusterReference, hostAddr string, portsMap base.HostPortMapType, ch chan<- []error, utils xdcrUtils.UtilsIface, logger *log.CommonLogger) {
+	stopFunc := utils.StartDiagStopwatch(fmt.Sprintf("connectToRemoteNS(%v)", hostAddr), xdcrBase.DiagInternalThreshold)
+	defer stopFunc()
+
+	// sleep for a random amount of time to not overwhelm the target
+	numMilliSec := rand.Intn(10000)
+	ticker := time.NewTicker(time.Duration(numMilliSec) * time.Millisecond)
+	logger.Debugf("connectionNS(hostAddr=%v) sleeping for %v milliseconds", hostAddr, numMilliSec)
+
+	select {
+	case <-ticker.C:
+		break
+	}
+
+	errs := make([]error, 0)
+	defer func() { ch <- errs }()
+
+	username, password, authMech, cert, SANInCert, clientCert, clientKey, err := ref.MyCredentials()
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	hostname := xdcrBase.GetHostName(hostAddr)
+	portsInfo, ok := portsMap[hostAddr]
+	if !ok {
+		err = errors.New("No port information found for hostname=" + hostname)
+		errs = append(errs, err)
+		return
+	}
+
+	var out interface{}
+	var port uint16
+	if !ref.DemandEncryption() || ref.EncryptionType() == metadata.EncryptionType_Half {
+		port, ok = portsInfo[base.PortsKeysForConnectionPreCheck[base.MgmtIdxForConnPreChk]]
+		if !ok {
+			err = errors.New("No Mgt port information found for hostname=" + hostname)
+			errs = append(errs, err)
+			return
+		}
+	} else {
+		port, ok = portsInfo[base.PortsKeysForConnectionPreCheck[base.MgmtSSLIdxForConnPreChk]]
+		if !ok {
+			err = errors.New("No MgtSSL port information found for hostname=" + hostname)
+			errs = append(errs, err)
+			return
+		}
+	}
+
+	hostAddr = xdcrBase.GetHostAddr(hostname, port)
+	err, _ = utils.QueryRestApiWithAuth(hostAddr, base.WhoAmIPath, false, username, password, authMech, cert, SANInCert, clientCert,
+		clientKey, xdcrBase.MethodGet, xdcrBase.JsonContentType, nil, base.ConnectionPreCheckRPCTimeout, &out, nil, false, logger)
+
+	errs = append(errs, err)
+	return
+}
+
+func connectToRemoteKV(ref *metadata.RemoteClusterReference, hostAddr string, portsMap base.HostPortMapType, ch chan<- []error, utils xdcrUtils.UtilsIface, logger *log.CommonLogger) {
+	stopFunc := utils.StartDiagStopwatch(fmt.Sprintf("connectToRemoteKV(%v)", hostAddr), xdcrBase.DiagInternalThreshold)
+	defer stopFunc()
+
+	// sleep for a random amount of time to not overwhelm the target
+	numMilliSec := rand.Intn(10000)
+	ticker := time.NewTicker(time.Duration(numMilliSec) * time.Millisecond)
+	logger.Debugf("connectToRemoteKV(hostAddr=%v) sleeping for %v milliseconds", hostAddr, numMilliSec)
+
+	select {
+	case <-ticker.C:
+		break
+	}
+
+	errs := make([]error, 0)
+	defer func() { ch <- errs }()
+
+	poolName := "connectionPreCheckPool"
+	hostname := xdcrBase.GetHostName(hostAddr)
+
+	username, password, _, cert, SANInCert, clientCert, clientKey, err := ref.MyCredentials()
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	portsInfo, ok := portsMap[hostAddr]
+	if !ok {
+		err = errors.New("No port information found for hostname=" + hostname)
+		errs = append(errs, err)
+		return
+	}
+
+	var pool xdcrBase.ConnPool
+	var port uint16
+	if !ref.DemandEncryption() || ref.EncryptionType() == metadata.EncryptionType_Half {
+		port, ok = portsInfo[base.PortsKeysForConnectionPreCheck[base.KVIdxForConnPreChk]]
+		if !ok {
+			err = errors.New("No KV port information found for hostname=" + hostname)
+			errs = append(errs, err)
+			return
+		}
+
+	} else {
+		port, ok = portsInfo[base.PortsKeysForConnectionPreCheck[base.KVSSLIdxForConnPreChk]]
+		if !ok {
+			err = errors.New("No KVSSL port information found for hostname=" + hostname)
+			errs = append(errs, err)
+			return
+		}
+	}
+
+	if !ref.DemandEncryption() || ref.EncryptionType() == metadata.EncryptionType_Half {
+		hostAddr = xdcrBase.GetHostAddr(hostname, uint16(port))
+		pool, err = xdcrBase.ConnPoolMgr().GetOrCreatePool(poolName, hostAddr, "", username, password, 0, !ref.DemandEncryption())
+	} else {
+		pool, err = xdcrBase.ConnPoolMgr().GetOrCreateSSLOverMemPool(poolName, hostname, "", username, password, 0, int(port), cert, SANInCert, clientCert, clientKey)
+	}
+	if err != nil {
+		errs = append(errs, err)
+		return
+	}
+
+	resultCh := make(chan mccClientIfcWithErr, 1)
+	go func() {
+		result, err := pool.GetNew(SANInCert)
+		select {
+		case resultCh <- mccClientIfcWithErr{clientIfc: result, err: err}:
+			return
+		default:
+			return
+		}
+	}()
+
+	ticker = time.NewTicker(base.ConnectionPreCheckRPCTimeout)
+	var clientIfc mcc.ClientIface = nil
+
+	select {
+	case <-ticker.C:
+		errs = append(errs, fmt.Errorf("Timeout encountered before successfully connecting to remote KV for hostAddr=%v", hostAddr))
+		return
+	case result := <-resultCh:
+		ticker.Stop()
+		clientIfc = result.clientIfc
+		err = result.err
+		if err != nil {
+			errs = append(errs, err)
+			return
+		}
+	}
+
+	client, ok := clientIfc.(mcc.ClientIface)
+	if !ok {
+		errs = append(errs, fmt.Errorf("Wrong type of client in connectToRemoteKV for hostAddr=%v", hostAddr))
+		return
+	}
+	err = client.Close()
+	if err != nil {
+		errs = append(errs, err)
+		return
+	}
+}
+
+func nodeServicesInfoParseError(nodeServicesInfo map[string]interface{}, logger *log.CommonLogger) error {
+	errMsg := "Error parsing Node Services information of remote cluster."
+	detailedErrMsg := errMsg + fmt.Sprintf("nodeServicesInfo=%v", nodeServicesInfo)
+	if logger != nil {
+		logger.Errorf(detailedErrMsg)
+	}
+	return fmt.Errorf(errMsg)
+}
+
+const TCP = "tcp"   // ipv4/ipv6 are both supported
+const TCP4 = "tcp4" // ipv4 only
+const TCP6 = "tcp6" // ipv6 only
+
+var NetTCP = TCP
+
+func IsIpV4Blocked() bool {
+	return NetTCP == TCP6
+}
+
+func IsIpV6Blocked() bool {
+	return NetTCP == TCP4
+}
+
+var IpFamilyStr = "tcp4/tcp6"
+var AddressNotAllowedErrorMessageFmt = "The address %v is not allowed."
+
+var IpFamilyOnlyErrorMessage = fmt.Sprintf("The cluster is %v only. ", IpFamilyStr)
+var IpFamilyAddressNotFoundMessageFmt = "Cannot find address in the ip family for %v."
+
+func MapToSupportedIpFamily(connStr string, isTLS bool) (string, error) {
+	if !IsIpV4Blocked() && !IsIpV6Blocked() { // Both address family are supported
+		return connStr, nil
+	}
+
+	hostname := xdcrBase.GetHostName(connStr)
+	// If it is in bracket, it is ipv6 address
+	if xdcrBase.IsIpAddressEnclosedInBrackets(hostname) {
+		if IsIpV6Blocked() == true {
+			return "", fmt.Errorf(IpFamilyOnlyErrorMessage + fmt.Sprintf(AddressNotAllowedErrorMessageFmt, hostname))
+		} else {
+			return connStr, nil
+		}
+	}
+
+	// Check if it is already an ip address
+	if addr := net.ParseIP(hostname); addr != nil {
+		if addr.To4() != nil {
+			if !IsIpV4Blocked() {
+				return connStr, nil
+			} else {
+				return "", fmt.Errorf(IpFamilyOnlyErrorMessage + fmt.Sprintf(AddressNotAllowedErrorMessageFmt, hostname))
+			}
+		} else { // IPV6
+			if !IsIpV6Blocked() {
+				return connStr, nil
+			} else {
+				return "", fmt.Errorf(IpFamilyOnlyErrorMessage + fmt.Sprintf(AddressNotAllowedErrorMessageFmt, hostname))
+			}
+		}
+	}
+
+	addrs, err := net.LookupIP(hostname)
+	if err != nil {
+		return "", fmt.Errorf("Lookup failed for %v: %v", hostname, err)
+	}
+	switch isTLS {
+	case true:
+		// If using TLS, then the connection string should be returned as is because the server's TLS certificate
+		// most likely has a SAN section with DNS name, but not IP specific. If returned IP, it'll cause a TLS handshake
+		// failure
+		// Nevertheless, we should still check to ensure that the IP lookups correspond with the desired mode
+		var ipv4FoundExample string
+		var ipv6FoundExample string
+		for _, addr := range addrs {
+			if addr.To4() != nil { // IPV4 address
+				ipv4FoundExample = addr.To4().String()
+			} else {
+				ipv6FoundExample = addr.String()
+			}
+			if IsIpV4Blocked() && ipv4FoundExample != "" {
+				return "", fmt.Errorf("IPv6 only mode specified but given hostname %v found IPv4 address %v", hostname, ipv4FoundExample)
+			} else if IsIpV6Blocked() && ipv6FoundExample != "" {
+				return "", fmt.Errorf("IPv4 only mode specified but given hostname %v found IPv6 address %v", hostname, ipv6FoundExample)
+			}
+		}
+		return connStr, nil
+	case false:
+		for _, addr := range addrs {
+			if addr.To4() != nil && !IsIpV4Blocked() { // IPV4 address
+				port, portErr := xdcrBase.GetPortNumber(connStr)
+				if portErr == nil {
+					return xdcrBase.GetHostAddr(fmt.Sprintf("%v", addr), port), nil
+				} else {
+					return fmt.Sprintf("%v", addr), nil
+				}
+			} else if addr.To4() == nil && !IsIpV6Blocked() { // IPV6 address
+				port, portErr := xdcrBase.GetPortNumber(connStr)
+				if portErr == nil {
+					return xdcrBase.GetHostAddr(fmt.Sprintf("%v", addr), port), nil
+				} else {
+					return fmt.Sprintf("[%v]", addr), nil
+				}
+			}
+		}
+	}
+	return "", fmt.Errorf(IpFamilyOnlyErrorMessage + fmt.Sprintf(IpFamilyAddressNotFoundMessageFmt, hostname))
+}
+
+func getHostAddrFromNodeInfoInternal(adminHostAddr string, nodeInfo map[string]interface{}, logger *log.CommonLogger) (string, error) {
+	var hostAddr string
+	var ok bool
+
+	hostAddrObj, ok := nodeInfo[xdcrBase.HostNameKey]
+	if !ok {
+		logger.Infof("hostname is missing from node info %v. Host name in remote cluster reference, %v, will be used.\n", nodeInfo, adminHostAddr)
+		return "", xdcrBase.ErrorNoHostName
+	} else {
+		hostAddr, ok = hostAddrObj.(string)
+		if !ok {
+			return "", fmt.Errorf("Error getting host address from target cluster %v. host name, %v, is of wrong type\n", adminHostAddr, hostAddrObj)
+		}
+	}
+	_, err := MapToSupportedIpFamily(hostAddr, false)
+	if err != nil {
+		// The hostAddr cannot be mapped to the supported IP Address
+		return "", err
+	}
+	return hostAddr, nil
+}
+
+// this method is called when nodeInfo came from the terse bucket call, pools/default/b/[bucketName]
+// where hostname in nodeInfo is a host name without port rather than a host address with port
+func getHostNameWithoutPortFromNodeInfo(adminHostAddr string, nodeInfo map[string]interface{}, logger *log.CommonLogger, u *xdcrUtils.UtilsIface) (string, error) {
+	hostName, err := getHostAddrFromNodeInfoInternal(adminHostAddr, nodeInfo, logger)
+	if err == xdcrBase.ErrorNoHostName {
+		hostName = xdcrBase.GetHostName(adminHostAddr)
+		err = nil
+	}
+
+	return hostName, err
+}
+
+func GetPortsAndHostAddrsFromNodeServices(nodeServicesInfo map[string]interface{}, defaultConnStr string, useSecurePort bool, logger *log.CommonLogger, u *xdcrUtils.UtilsIface) (base.HostPortMapType, []string, error) {
+	nodesExt, ok := nodeServicesInfo[xdcrBase.NodeExtKey]
+	portsMap := make(base.HostPortMapType)
+	hostAddrs := make([]string, 0)
+
+	if !ok {
+		return nil, nil, nodeServicesInfoParseError(nodeServicesInfo, logger)
+	}
+
+	nodesExtArray, ok := nodesExt.([]interface{})
+	if !ok {
+		return nil, nil, nodeServicesInfoParseError(nodeServicesInfo, logger)
+	}
+
+	var hostName string
+	var err error
+	for _, nodeExt := range nodesExtArray {
+		nodeExtMap, ok := nodeExt.(map[string]interface{})
+		if !ok {
+			return nil, nil, nodeServicesInfoParseError(nodeServicesInfo, logger)
+		}
+
+		// note that this is the only place where nodeExtMap contains a hostname without port
+		// instead of a host address with port
+		hostName, err = getHostNameWithoutPortFromNodeInfo(defaultConnStr, nodeExtMap, logger, u)
+
+		if err != nil {
+			return nil, nil, nodeServicesInfoParseError(nodeServicesInfo, logger)
+		}
+
+		// Internal key
+		service, ok := nodeExtMap[base.ServicesKey]
+		if !ok {
+			return nil, nil, nodeServicesInfoParseError(nodeServicesInfo, logger)
+		}
+
+		services_map, ok := service.(map[string]interface{})
+		if !ok {
+			return nil, nil, nodeServicesInfoParseError(nodeServicesInfo, logger)
+		}
+
+		_, hasKV := services_map[base.KVPortKey]
+		_, hasKVSSL := services_map[base.KVSSLPortKey]
+		_, hasMgmtSSL := services_map[base.SSLMgtPortKey]
+		useSecurePort = useSecurePort && hasMgmtSSL
+
+		// consider the nodes if it has KV service only
+		if !hasKV && !hasKVSSL {
+			continue
+		}
+
+		hostAddr := hostName
+		var port interface{}
+		if useSecurePort {
+			port, ok = services_map[base.SSLMgtPortKey]
+		} else {
+			port, ok = services_map[base.MgtPortKey]
+		}
+		if ok {
+			portFloat, ok := port.(float64)
+			if !ok {
+				return nil, nil, nodeServicesInfoParseError(nodeServicesInfo, logger)
+			}
+			mgmtPort := uint16(portFloat)
+			hostAddr = xdcrBase.GetHostAddr(hostName, mgmtPort)
+		}
+
+		for _, portKey := range base.PortsKeysForConnectionPreCheck {
+			var portInt uint16
+			port, ok := services_map[portKey]
+			if !ok {
+				// the node may not have the service. skip the node
+				continue
+			}
+
+			portFloat, ok := port.(float64)
+			if !ok {
+				return nil, nil, nodeServicesInfoParseError(nodeServicesInfo, logger)
+			}
+
+			portInt = uint16(portFloat)
+
+			_, ok = portsMap[hostAddr]
+			if !ok {
+				portsMap[hostAddr] = make(map[string]uint16)
+			}
+			portsMap[hostAddr][portKey] = portInt
+		}
+
+		hostAddrs = append(hostAddrs, hostAddr)
+	}
+	logger.Debugf("Ports=%v; HostAddrs=%v in GetPortsAndHostAddrsFromNodeServices()", portsMap, hostAddrs)
+	return portsMap, hostAddrs, nil
+}
+
+func GetNodeServicesInfo(hostAddr, username, password string, authMech xdcrBase.HttpAuthMech, certificate []byte, sanInCertificate bool, clientCertificate, clientKey []byte, logger *log.CommonLogger, u *xdcrUtils.Utilities) (map[string]interface{}, error) {
+	nodeServicesInfo := make(map[string]interface{})
+	err, statusCode := u.QueryRestApiWithAuth(hostAddr, xdcrBase.NodeServicesPath, false, username, password, authMech, certificate, sanInCertificate, clientCertificate, clientKey, xdcrBase.MethodGet, "", nil, 0, &nodeServicesInfo, nil, false, logger)
+
+	if err != nil || statusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed on calling host=%v, path=%v, err=%v, statusCode=%v", hostAddr, xdcrBase.NodeServicesPath, err, statusCode)
+	}
+
+	return nodeServicesInfo, nil
+}
+
+func collectResults(result base.HostToErrorsMapType, hostAddr string, ch <-chan []error, wg *sync.WaitGroup, mu *sync.Mutex) {
+	defer wg.Done()
+
+	errNS := <-ch
+	for _, err := range errNS {
+		if err != nil {
+			mu.Lock()
+			result[hostAddr] = append(result[hostAddr], fmt.Sprintf("%v", err))
+			mu.Unlock()
+		}
+	}
+}
+
+func (xdt *xdcrDiffTool) NsServerPreCheck() {
+	refs := []*metadata.RemoteClusterReference{xdt.selfRef, xdt.specifiedRef}
+	for _, ref := range refs {
+		username, password, authMech, cert, SANInCert, clientCert, clientKey, err := ref.MyCredentials()
+		if err != nil {
+			xdt.logger.Errorf("Connection Pre-Check exited because of error in getting credentials, err=%v", err)
+			return
+		}
+
+		remoteClusterRefMap := ref.ToMap()
+
+		hostname, ok := remoteClusterRefMap[base.RemoteClusterHostName].(string)
+		if !ok {
+			xdt.logger.Errorf("Connection Pre-Check exited because of error in getting hostname")
+			return
+		}
+
+		nodeServicesInfo, err := GetNodeServicesInfo(
+			hostname,
+			username,
+			password,
+			authMech,
+			cert,
+			SANInCert,
+			clientCert,
+			clientKey,
+			xdt.logger,
+			xdcrUtils.NewUtilities(),
+		)
+		if err != nil {
+			xdt.logger.Errorf("Connection Pre-Check exited while getting nodeServicesInfo, err=%v", err)
+			return
+		}
+		portsMap, targetNodes, err := GetPortsAndHostAddrsFromNodeServices(nodeServicesInfo, hostname, ref.DemandEncryption(), xdt.logger, &xdt.utils)
+		if err != nil {
+			xdt.logger.Errorf("Connection Pre-Check exited while getting ports and hostAddrs from nodeServicesInfo, err=%v", err)
+			return
+		}
+
+		if len(targetNodes) == 0 {
+			xdt.logger.Errorf("Connection Pre-Check exited because, no valid nodes found in the target cluser with targetNodes=%v", targetNodes)
+			return
+		}
+
+		result := make(base.HostToErrorsMapType)
+		var muForResult sync.Mutex
+		var wgForResult sync.WaitGroup
+		for _, hostAddr := range targetNodes {
+			result[hostAddr] = []string{}
+
+			wgForResult.Add(1)
+
+			chNS := make(chan []error, 1)
+
+			go connectToRemoteNS(ref, hostAddr, portsMap, chNS, xdt.utils, xdt.logger)
+
+			go collectResults(result, hostAddr, chNS, &wgForResult, &muForResult)
+		}
+
+		wgForResult.Wait()
+		xdt.logger.Infof("Errors while connecting ns_server to remote reference name=%v and uuid=%v : %v", ref.Name(), ref.Uuid(), result)
+	}
+}
+
+func (xdt *xdcrDiffTool) MemcachedPreCheck() {
+	refs := []*metadata.RemoteClusterReference{xdt.selfRef, xdt.specifiedRef}
+	for _, ref := range refs {
+		username, password, authMech, cert, SANInCert, clientCert, clientKey, err := ref.MyCredentials()
+		if err != nil {
+			xdt.logger.Errorf("Connection Pre-Check exited because of error in getting credentials, err=%v", err)
+			return
+		}
+
+		remoteClusterRefMap := ref.ToMap()
+
+		hostname, ok := remoteClusterRefMap[base.RemoteClusterHostName].(string)
+		if !ok {
+			xdt.logger.Errorf("Connection Pre-Check exited because of error in getting hostname")
+			return
+		}
+
+		nodeServicesInfo, err := GetNodeServicesInfo(
+			hostname,
+			username,
+			password,
+			authMech,
+			cert,
+			SANInCert,
+			clientCert,
+			clientKey,
+			xdt.logger,
+			xdcrUtils.NewUtilities(),
+		)
+		if err != nil {
+			xdt.logger.Errorf("Connection Pre-Check exited while getting nodeServicesInfo, err=%v", err)
+			return
+		}
+		portsMap, targetNodes, err := GetPortsAndHostAddrsFromNodeServices(nodeServicesInfo, hostname, ref.DemandEncryption(), xdt.logger, &xdt.utils)
+		if err != nil {
+			xdt.logger.Errorf("Connection Pre-Check exited while getting ports and hostAddrs from nodeServicesInfo, err=%v", err)
+			return
+		}
+
+		if len(targetNodes) == 0 {
+			xdt.logger.Errorf("Connection Pre-Check exited because, no valid nodes found in the target cluser with targetNodes=%v", targetNodes)
+			return
+		}
+
+		result := make(base.HostToErrorsMapType)
+		var muForResult sync.Mutex
+		var wgForResult sync.WaitGroup
+		for _, hostAddr := range targetNodes {
+			result[hostAddr] = []string{}
+
+			wgForResult.Add(1)
+
+			chKV := make(chan []error, 1)
+
+			go connectToRemoteKV(ref, hostAddr, portsMap, chKV, xdt.utils, xdt.logger)
+
+			go collectResults(result, hostAddr, chKV, &wgForResult, &muForResult)
+		}
+
+		wgForResult.Wait()
+		xdt.logger.Infof("Errors while connecting KV to remote reference name=%v and uuid=%v : %v", ref.Name(), ref.Uuid(), result)
+	}
 }
 
 func NewDiffTool(legacyMode bool) (*xdcrDiffTool, error) {
@@ -501,31 +1063,42 @@ func main() {
 		os.Exit(1)
 	}
 
-	// if options.runDataGeneration {
-	// 	err := difftool.generateDataFiles()
-	// 	if err != nil {
-	// 		fmt.Printf("Error generating data files. err=%v\n", err)
-	// 		os.Exit(1)
-	// 	}
-	// } else {
-	// 	fmt.Printf("Skipping  generating data files since it has been disabled\n")
-	// }
+	switch options.preCheckMode {
+	case int(base.NoPreCheck):
+		difftool.logger.Infof("Running normal xdcrDiffer with SDK verbose logging")
+		gocb.SetLogger(gocb.VerboseStdioLogger())
+		if options.runDataGeneration {
+			err := difftool.generateDataFiles()
+			if err != nil {
+				fmt.Printf("Error generating data files. err=%v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Printf("Skipping  generating data files since it has been disabled\n")
+		}
 
-	// if options.runFileDiffer {
-	// 	err := difftool.diffDataFiles()
-	// 	if err != nil {
-	// 		fmt.Printf("Error running file difftool. err=%v\n", err)
-	// 		os.Exit(1)
-	// 	}
-	// } else {
-	// 	fmt.Printf("Skipping file difftool since it has been disabled\n")
-	// }
+		if options.runFileDiffer {
+			err := difftool.diffDataFiles()
+			if err != nil {
+				fmt.Printf("Error running file difftool. err=%v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Printf("Skipping file difftool since it has been disabled\n")
+		}
 
-	// if options.runMutationDiffer {
-	// 	difftool.runMutationDiffer()
-	// } else {
-	// 	fmt.Printf("Skipping mutation diff since it has been disabled\n")
-	// }
+		if options.runMutationDiffer {
+			difftool.runMutationDiffer()
+		} else {
+			fmt.Printf("Skipping mutation diff since it has been disabled\n")
+		}
+	case int(base.NsServerConnectionCheck):
+		difftool.logger.Infof("Running ns_server connection xdcrDiffer")
+		difftool.NsServerPreCheck()
+	case int(base.KvConnectionCheck):
+		difftool.logger.Infof("Running KV connection xdcrDiffer")
+		difftool.MemcachedPreCheck()
+	}
 }
 
 func isURLLoopBack(url string) bool {

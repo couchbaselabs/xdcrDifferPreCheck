@@ -9,6 +9,8 @@
 
 package base
 
+import "time"
+
 const NumberOfVbuckets = 1024
 const DcpHandlerChanSize = 100000
 const FileNamePrefix = "diffTool"
@@ -102,3 +104,44 @@ const CouchbaseSecurePrefix = "couchbases://"
 var SetupTimeoutSeconds int = 10
 
 const JSONDataType = 1
+
+var PreCheckMode int = 0
+
+const (
+	KVIdxForConnPreChk      = iota
+	KVSSLIdxForConnPreChk   = iota
+	MgmtIdxForConnPreChk    = iota
+	MgmtSSLIdxForConnPreChk = iota
+)
+
+var KVPortKey = "kv"
+var KVSSLPortKey = "kvSSL"
+var SSLMgtPortKey = "mgmtSSL"
+var MgtPortKey = "mgmt"
+
+var PortsKeysForConnectionPreCheck = map[PortType]string{
+	KVIdxForConnPreChk:      KVPortKey,
+	KVSSLIdxForConnPreChk:   KVSSLPortKey,
+	MgmtIdxForConnPreChk:    MgtPortKey,
+	MgmtSSLIdxForConnPreChk: SSLMgtPortKey,
+}
+
+type PortType int
+
+type HostPortMapType map[string]map[string]uint16
+
+const WhoAmIPath = "/whoami"
+
+var ConnectionPreCheckRPCTimeout = 15 * time.Second
+var ServicesKey = "services"
+var RemoteClusterHostName = "hostname"
+
+type HostToErrorsMapType map[string][]string
+
+type preCheckType int
+
+const (
+	NoPreCheck              preCheckType = iota
+	NsServerConnectionCheck preCheckType = iota
+	KvConnectionCheck       preCheckType = iota
+)

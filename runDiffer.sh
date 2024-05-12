@@ -25,7 +25,7 @@ function printHelp() {
 	findExec
 
 	cat <<EOF
-Usage: $0 -u <username> -p <password> -h <hostname:port> -s <sourceBucket> -t <targetBucket> -r <remoteClusterName> [-v <targetUrl>] [-n <remoteClusterUsername> -q <remoteClusterPassword>] [-c clean] [-b ] [-e <mutationRetries>] [-w <setupTimeoutInSeconds>]
+Usage: $0 -u <username> -p <password> -h <hostname:port> -s <sourceBucket> -t <targetBucket> -r <remoteClusterName> -g <preCheckMode=(0|1|2)> [-v <targetUrl>] [-n <remoteClusterUsername> -q <remoteClusterPassword>] [-c clean] [-b ] [-e <mutationRetries>] [-w <setupTimeoutInSeconds>]
 
 This script will set up the necessary environment variable to allow the XDCR diff tool to connect to the metakv service in the
 specified source cluster (NOTE: over http://) and retrieve the specified replication spec and run the difftool on it.
@@ -33,6 +33,14 @@ The difftool currently only supports connecting to remote targets with username 
 reference only contains certificate, then specify the remoteClusterUsername and remoteClusterPassword accordingly.
 
 use "-b" to get document body for comparison instead of metadata. This is a slower option and it will not get tombstones
+
+use "-g" change the mode of pre-check:
+0: no extra pre-check. Runs differ with SDK verbose debug logging.
+	- Results will be logged in xdcrDiffer_noPrecheck.log
+1: connection pre-check performed on ns_server port of all source and target cluster nodes using the credentials that xdcrDiffer would use.
+	- Results will be logged in xdcrDiffer_nsServerPreCheck.log
+2: connection pre-check performed on memcached port of all source and target cluster nodes using the credentials that xdcrDiffer would use.
+	- Results will be logged in xdcrDiffer_kvPreCheck.log
 EOF
 }
 
@@ -54,7 +62,7 @@ function killBgTail {
 	fi
 }
 
-while getopts ":h:p:u:r:s:t:n:q:v:cbe:w:" opt; do
+while getopts ":h:p:u:r:s:t:n:q:v:cbe:w:g:" opt; do
 	case ${opt} in
 	u)
 		username=$OPTARG
@@ -97,6 +105,9 @@ while getopts ":h:p:u:r:s:t:n:q:v:cbe:w:" opt; do
 		;;
 	w)
 		setupTimeout=$OPTARG
+		;;
+	g)
+		preCheckMode=$OPTARG
 		;;
 	\?)
 		echo "Invalid option: $OPTARG" 1>&2
@@ -199,6 +210,25 @@ if [[ ! -z "$setupTimeout" ]]; then
 	execString="${execString} -setupTimeout"
 	execString="${execString} $setupTimeout"
 fi
+if [[ ! -z "$preCheckMode" ]]; then
+	execString="${execString} -preCheckMode"
+	execString="${execString} $preCheckMode"
+
+	if (( $preCheckMode == 0 )); then
+		differLogFileName="xdcrDiffer_noPrecheck.log"
+	elif (( $preCheckMode == 1 )); then
+		differLogFileName="xdcrDiffer_nsServerPreCheck.log"
+	elif (( $preCheckMode == 2  )); then
+		differLogFileName="xdcrDiffer_kvPreCheck.log"
+	else
+		echo "Invalid -preCheckMode or -g value. Can be 0, 1 or 2." 
+		exit 1
+	fi
+
+	echo "Results logged as $differLogFileName"
+fi
+
+echo $execString
 
 # Execute the differ in background and watch the pid to be finished
 $execString >$differLogFileName 2>&1 &

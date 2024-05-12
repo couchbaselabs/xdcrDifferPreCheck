@@ -5,3 +5,8 @@ mutationDiff/
 source/
 target/
 xdcrDiffer
+xdcrDiffer_nsServerPreCheck.log
+xdcrDiffer_kvPreCheck.log
+xdcrDiffer_noPrecheck.log
+go.sum
+go.mod

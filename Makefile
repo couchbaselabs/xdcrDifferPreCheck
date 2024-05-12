@@ -42,3 +42,5 @@ deps:
 	$(GOGET) github.com/couchbase/clog
 	$(GOGET) github.com/stretchr/testify/assert
 	$(GOGET) github.com/stretchr/testify/mock
+	$(GOGET) github.com/couchbase/goxdcr/utils@v7.1.0-1003.0.20210604162540-5cfe9a9d4abe+incompatible
+	$(GOGET) github.com/couchbase/goxdcr/metadata_svc@v7.1.0-1003.0.20210604162540-5cfe9a9d4abe+incompatible
